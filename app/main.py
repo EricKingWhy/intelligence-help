@@ -20,6 +20,7 @@ from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
 from app.api.extract import router as extract_router
 from app.api.feedback import router as feedback_router
+from app.api.handoffs import customer_router as handoff_router, operator_router as handoff_operator_router
 from app.api.jobs import router as jobs_router
 from app.api.kb import router as kb_router
 from app.api.observability import router as observability_router
@@ -81,9 +82,10 @@ app.include_router(extract_router, dependencies=[Depends(identity)])
 app.include_router(agent_router)
 app.include_router(conversations_router)
 app.include_router(feedback_router)
+app.include_router(handoff_router)
 _operator_only = [Depends(operator)]
 for router in (review_router, topics_router, acceptance_router, kb_router, rageval_router,
-               observability_router, admin_router, jobs_router):
+               observability_router, admin_router, jobs_router, handoff_operator_router):
     app.include_router(router, dependencies=_operator_only)
 
 # 后台各页共用外壳(样式 + 取数/重跑脚本 + 导航),抽成文件放静态目录
@@ -100,6 +102,11 @@ async def admin_page() -> FileResponse:
     """后台管理首页:知识库、RAG 评估、飞轮待审、观测与成本、主题分布、分类器验收各一张卡,一处进出。
     各模块页面还是各自原本的路径,首页只把入口收到一起,文档里贴过的链接照样能用。"""
     return FileResponse(_STATIC_DIR / "admin.html")
+
+
+@app.get("/handoffs", include_in_schema=False, dependencies=_operator_only)
+async def handoff_page() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "handoffs.html")
 
 
 @app.get("/kb", include_in_schema=False, dependencies=_operator_only)

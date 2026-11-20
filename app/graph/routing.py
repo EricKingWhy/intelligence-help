@@ -23,6 +23,8 @@ INTENT_TO_ROUTE: dict[str, str] = {
 
 def route_by_intent(state) -> str:
     """按意图分流;未知意图保守归 business(让 Agent 自己应对)。"""
+    if state.get("route") == "handoff":
+        return "handoff"
     return INTENT_TO_ROUTE.get(state.get("intent", ""), "business")
 
 

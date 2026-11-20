@@ -37,7 +37,7 @@ def _sse(payload: dict) -> str:
 async def create_ticket_action(
     req: CreateTicketRequest, principal: Principal, key: SubmissionKey = None,
 ) -> CreateTicketResponse:
-    """建工单按钮:用户点了才写 tickets 表(复用 ch02 工单能力)。转人工是另一件事,纯前端。"""
+    """建工单按钮:用户点了才写 tickets 表(复用 ch02 工单能力)。"""
     await owned_conversation(principal, req.conversation_id)
     try:
         options = {"submission_key": f"ticket:{key}"} if key else {}

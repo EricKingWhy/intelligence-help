@@ -68,7 +68,13 @@
       border-right: 4px solid var(--ink);
       background: var(--paper);
     }
-    @media (max-width: 779px) { #sidebar { display: none; } }
+    .mobile-conversation { display: none; }
+    @media (max-width: 779px) {
+      #sidebar { display: none; }
+      .mobile-conversation { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--ink); }
+      .mobile-conversation label { font-size: .875rem; font-weight: 700; flex: none; }
+      .mobile-conversation select { min-width: 0; flex: 1; font: inherit; color: var(--ink); background: var(--paper); border: 2px solid var(--ink); padding: 5px 7px; }
+    }
     .sb-head {
       padding: 14px 12px;
       border-bottom: 4px solid var(--ink);
@@ -450,6 +456,16 @@
     #send:disabled { background: #d8cbc0; cursor: not-allowed; box-shadow: none; }
     #send svg { width: 22px; height: 22px; display: block; }
     .foot-note { text-align: center; color: var(--muted); font-size: 11px; margin: 10px 0 0; letter-spacing: .3px; }
+    .handoff-confirm { margin-top: 8px; font-size: .875rem; }
+    .handoff-confirm p { margin: 6px 0; color: var(--ink); }
+    .handoff-confirm .action-bar { margin-top: 8px; }
+    #handoff-status { padding: 8px 12px; border: 2px solid var(--ink); background: var(--paper); margin-bottom: 10px; }
+    #handoff-status summary { cursor: pointer; font-weight: 700; }
+    #handoff-items { padding-inline-start: 24px; max-height: 28vh; overflow: auto; }
+    #handoff-items li { margin: 8px 0; overflow-wrap: anywhere; }
+    #handoff-items strong { font-weight: 700; }
+    .handoff-ticket-status { display: inline-block; margin-inline-start: 6px; }
+    #handoff-items p { margin: 4px 0; white-space: pre-wrap; }
   </style>
 </head>
 <body>
@@ -468,10 +484,20 @@
       <div class="spacer"></div>
       <button id="new-chat" type="button">＋ 新对话</button>
     </header>
+    <div class="mobile-conversation">
+      <label for="mobile-conversations">会话</label>
+      <select id="mobile-conversations" aria-label="切换会话"></select>
+    </div>
 
     <div id="messages"></div>
 
     <footer>
+      <details id="handoff-status" hidden>
+        <summary id="handoff-summary">人工工单</summary>
+        <p id="handoff-notice" role="status"></p>
+        <ul id="handoff-items"></ul>
+        <button class="action-btn" id="handoff-refresh" type="button">刷新工单状态</button>
+      </details>
       <div class="composer">
         <textarea id="input" rows="1" placeholder="输入消息,和小喵聊聊吧~(回车发送 / Shift+回车换行)"></textarea>
         <button id="send" type="button" aria-label="发送">
@@ -483,7 +509,7 @@
           </svg>
         </button>
       </div>
-      <p class="foot-note">小喵是 AI 助手,涉及具体订单会为你转接人工核实</p>
+      <p class="foot-note">小喵是 AI 助手，需要人工核实时可在回复下提交转接工单</p>
     </footer>
     </div><!-- /.main -->
   </div>
@@ -834,8 +860,111 @@
       bubble.appendChild(bar);
     }
 
-    // ---------- ch05:actions 帧 - 转人工/建工单两按钮交互 ----------
+    const handoffStatus = document.getElementById("handoff-status");
+    const handoffSummary = document.getElementById("handoff-summary");
+    const handoffItems = document.getElementById("handoff-items");
+    const handoffNotice = document.getElementById("handoff-notice");
+    const handoffRefresh = document.getElementById("handoff-refresh");
+    let handoffFetch = 0;
+
+    async function loadHandoffs(cid, reveal = false) {
+      const revision = ++handoffFetch;
+      if (!cid) {
+        handoffStatus.hidden = true;
+        handoffStatus.open = false;
+        handoffItems.replaceChildren();
+        return;
+      }
+      handoffRefresh.disabled = true;
+      handoffNotice.textContent = "正在刷新…";
+      try {
+        const response = await fetch("/api/conversations/" + cid + "/handoffs?user_id="
+          + encodeURIComponent(getUserId()));
+        if (revision !== handoffFetch || cid !== getConversationId()) return;
+        if (!response.ok) throw new Error("status request failed");
+        const { items } = await response.json();
+        if (revision !== handoffFetch || cid !== getConversationId()) return;
+        handoffItems.replaceChildren(...items.map(item => {
+          const li = document.createElement("li");
+          const number = document.createElement("strong");
+          number.textContent = item.ticket_no;
+          const status = document.createElement("span");
+          status.className = "handoff-ticket-status";
+          status.textContent = " " + item.status;
+          li.append(number, status);
+          if (item.resolution) {
+            const note = document.createElement("p");
+            note.textContent = item.resolution;
+            li.appendChild(note);
+          }
+          return li;
+        }));
+        handoffSummary.textContent = "人工工单（" + items.length + "）";
+        handoffStatus.hidden = items.length === 0;
+        if (reveal && items.length) handoffStatus.open = true;
+        handoffNotice.textContent = "";
+      } catch (error) {
+        if (revision === handoffFetch) handoffNotice.textContent = "状态暂时无法刷新，请重试。";
+      } finally {
+        if (revision === handoffFetch) handoffRefresh.disabled = false;
+      }
+    }
+
+    handoffRefresh.addEventListener("click", () => loadHandoffs(getConversationId(), true));
+
+    function confirmHandoff(button, cid, messageId) {
+      const panel = document.createElement("div");
+      panel.className = "handoff-confirm";
+      const note = document.createElement("p");
+      note.setAttribute("role", "status");
+      note.textContent = "确认后，您的问题和可用的订单、检索参考会发送给人工客服。";
+      const controls = document.createElement("div");
+      controls.className = "action-bar";
+      const confirm = document.createElement("button");
+      confirm.type = "button";
+      confirm.className = "action-btn";
+      confirm.textContent = "确认转人工";
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "action-btn";
+      cancel.textContent = "取消";
+      controls.append(confirm, cancel);
+      panel.append(note, controls);
+      button.hidden = true;
+      button.after(panel);
+      confirm.focus();
+      cancel.addEventListener("click", () => {
+        panel.remove();
+        button.hidden = false;
+        button.focus();
+      });
+      confirm.addEventListener("click", async () => {
+        confirm.disabled = cancel.disabled = true;
+        note.textContent = "正在提交…";
+        try {
+          const response = await fetch("/api/conversations/" + cid + "/handoffs", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user_id: getUserId(), message_id: messageId }),
+          });
+          const ticket = await response.json();
+          if (!response.ok) throw new Error(typeof ticket.detail === "string"
+            ? ticket.detail : "提交失败，请重试。");
+          note.textContent = "工单 " + ticket.ticket_no + " · " + ticket.status;
+          controls.remove();
+          if (cid === getConversationId()) {
+            handoffStatus.hidden = false;
+            loadHandoffs(cid, true);
+          }
+        } catch (error) {
+          note.textContent = error.message;
+          confirm.disabled = cancel.disabled = false;
+        }
+      });
+    }
+
+    // ---------- 聊天回复的可选操作 ----------
     function renderActions(bubble, items) {
+      const cid = getConversationId();
       const bar = document.createElement("div");
       bar.className = "action-bar";
       for (const a of items) {
@@ -849,15 +978,9 @@
         btn.type = "button";
         btn.className = "action-btn";
         if (a.type === "transfer_human") {
+          if (!cid || !a.message_id) continue;
           btn.textContent = "转人工";
-          btn.addEventListener("click", () => {
-            btn.disabled = true;
-            // 纯前端模拟:显示已转接 + 客服小猫问候(本章不接真人系统)
-            const sys = addRow("bot"); sys.textContent = "已转接人工客服";
-            const greet = addRow("bot");
-            greet.textContent = "您好,我是客服小猫,请问有什么可以帮您的";
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-          });
+          btn.addEventListener("click", () => confirmHandoff(btn, cid, a.message_id));
         } else if (a.type === "create_ticket") {
           btn.textContent = "建工单";
           // 点「建工单」不再直接建单,而是弹出工单表单让用户选类别+填描述再提交
@@ -1214,6 +1337,12 @@
 
     // ---------- ch07:会话侧栏(列表 / 切换 / 历史回载) ----------
     const convListEl = document.getElementById("conv-list");
+    const mobileConversations = document.getElementById("mobile-conversations");
+    mobileConversations.addEventListener("change", () => {
+      const cid = Number(mobileConversations.value);
+      if (cid && !sendBtn.disabled) switchConversation(cid);
+      else mobileConversations.value = String(getConversationId() || "");
+    });
 
     async function loadConversations() {
       try {
@@ -1225,6 +1354,11 @@
 
     function renderConvList(items) {
       convListEl.innerHTML = "";
+      const current = getConversationId();
+      mobileConversations.replaceChildren(new Option("选择会话", "", false, current === null));
+      for (const it of items) {
+        mobileConversations.add(new Option("#" + it.id + " " + (it.preview || ""), String(it.id), false, it.id === current));
+      }
       if (!items.length) {
         const d = document.createElement("div");
         d.className = "sb-empty";
@@ -1232,7 +1366,6 @@
         convListEl.appendChild(d);
         return;
       }
-      const current = getConversationId();
       for (const it of items) {
         const b = document.createElement("button");
         b.type = "button";
@@ -1247,36 +1380,40 @@
       }
     }
 
-    // 历史回载时补挂按钮:suggested_actions 不落库,但这两句话术是固定文案,
-    // 且转人工/建工单按钮不依赖当轮上下文(转人工纯前端模拟,建工单表单用户现填),
-    // 按文案精确匹配重建即可。话术改了这里要跟着改(单一来源在后端 prompts.py)。
-    const REPLAY_ACTIONS = [
-      { text: "抱歉,这个问题我暂时没有查到确切信息,不敢乱答。建议您联系人工客服进一步确认,以免给您错误的指引。",
-        actions: [{ type: "transfer_human" }] },
-      { text: "非常抱歉给您带来了不好的体验,我理解您的心情。您可以选择转接人工客服,或让我为您登记一张工单跟进处理。",
-        actions: [{ type: "transfer_human" }, { type: "create_ticket", draft: {} }] },
-    ];
+    const REPLAY_TICKET_TEXT = "非常抱歉给您带来了不好的体验,我理解您的心情。您可以选择转接人工客服,或让我为您登记一张工单跟进处理。";
 
     async function switchConversation(cid) {
       // 已是当前会话且聊天区有内容才跳过;页面刚刷新时聊天区是空的,点当前会话也要回载
       if (cid === getConversationId() && messagesEl.querySelector(".row")) return;
       setConversationId(cid);
+      handoffStatus.hidden = true;
+      handoffStatus.open = false;
+      loadHandoffs(cid);
       messagesEl.innerHTML = "";
       try {
         const r = await fetch("/api/conversations/" + cid + "/messages");
-        if (r.ok) {
-          for (const m of ((await r.json()).items || [])) {
+        if (cid !== getConversationId()) return;
+        if (r.status === 404) {
+          clearConversationId();
+          loadHandoffs(null);
+        } else if (r.ok) {
+          const {items} = await r.json();
+          if (cid !== getConversationId()) return;
+          for (const m of items || []) {
             if (!m.content) continue;
             if (m.role === "user") {
-              addRow("user").textContent = m.content;
+              const bubble = addRow("user");
+              bubble.textContent = m.content;
+              if (m.handoff_message_id) {
+                renderActions(bubble, [{type: "transfer_human", message_id: m.handoff_message_id}]);
+              }
             } else {
               const bubble = addRow("bot");
               const textEl = document.createElement("div");
               textEl.className = "bubble-text";
               textEl.innerHTML = renderMarkdown(m.content);
               bubble.appendChild(textEl);
-              const hit = REPLAY_ACTIONS.find((ra) => m.content.trim() === ra.text);
-              if (hit) renderActions(bubble, hit.actions);
+              if (m.content.trim() === REPLAY_TICKET_TEXT) renderActions(bubble, [{type: "create_ticket"}]);
               addFeedbackBar(bubble);   // 反馈条(👍/👎)回载也要有,和直播轮一致
             }
           }
@@ -1303,6 +1440,7 @@
     });
     newChatBtn.addEventListener("click", () => {
       clearConversationId();          // 开新会话:丢弃当前 conversation_id(旧会话仍在侧栏可切回)
+      loadHandoffs(null);
       renderEmptyState();
       loadConversations();            // 清 active 高亮
       inputEl.focus();
@@ -1310,7 +1448,9 @@
 
     getUserId();
     renderEmptyState();
-    loadConversations();              // ch07:进页面先拉会话列表
+    const currentConversation = getConversationId();
+    if (currentConversation) switchConversation(currentConversation);
+    else loadConversations();
     inputEl.focus();
   </script>
 </body>

@@ -38,13 +38,14 @@ RAG 策略比较与分类器留出集用法见 [评测说明](evaluation.md)。
 
 ## 已有数据库升级
 
-首次启动自动加载 `sql/`。升级已有数据库时先备份，并在应用进入维护状态时确认三项字段迁移未执行，再运行一次：
+首次启动自动加载 `sql/`。升级已有数据库时先备份并进入维护状态。按顺序执行还未应用的迁移，每份只执行一次。
 
 ```bash
 docker exec -it mewhelp-mysql mysql --default-character-set=utf8mb4 -uroot -p mewhelp -e 'source /docker-entrypoint-initdb.d/ch11-reliability.sql'
+docker exec -it mewhelp-mysql mysql --default-character-set=utf8mb4 -uroot -p mewhelp -e 'source /docker-entrypoint-initdb.d/ch12-handoff.sql'
 ```
 
-使用远程 MySQL 时，在自己的 MySQL 客户端运行 `source sql/ch11-reliability.sql`。
+使用远程 MySQL 时，在自己的 MySQL 客户端按同样顺序加载上述文件。
 
 ## 真实用户部署
 
@@ -60,3 +61,7 @@ docker exec -it mewhelp-mysql mysql --default-character-set=utf8mb4 -uroot -p me
 浏览器通过 HTTP Basic 的登录框输入账户和随机凭证。客户使用聊天页，运营人员可访问管理页。API 客户端提交工单或退款时传 `Idempotency-Key`，同一次提交的重试复用该值。示例订单和物流依然来自模拟业务后端，真实订单接入时应沿用服务端归属校验与同一可信身份。
 
 默认的 `demo` 模式兼容现有本机演示与课程脚本，仅用于本地测试。
+
+## 人工转接验收
+
+在聊天页输入“转人工”并确认，记录工单号。运营账户打开 `/handoffs`，展开该工单，核对本轮问题以及已有的订单和检索参考，接单后填写对客户可见的结论并结单。回到同一聊天会话，在“人工工单”里刷新并查看处理状态与结论。点击取消时不会创建工单，同一轮重复确认沿用原工单号。

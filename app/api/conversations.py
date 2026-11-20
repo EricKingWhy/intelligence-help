@@ -27,6 +27,7 @@ async def list_messages(conversation_id: int, principal: Principal):
     msgs = await repository.list_dialog_messages(conversation_id)
     return {"items": [
         {"role": m.role, "content": m.content or "",
-         "created_at": m.created_at.isoformat() if m.created_at else None}
+         "created_at": m.created_at.isoformat() if m.created_at else None,
+         **({"handoff_message_id": m.id} if (m.handoff_context or {}).get("offered") else {})}
         for m in msgs
     ]}

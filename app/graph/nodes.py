@@ -58,6 +58,7 @@ def _history_text(state, max_turns: int = 6) -> str:
 
 # 4+ 位连续数字视作订单号;用 lookaround 而非 \b——CJK 与数字同属 \w,\b 在「订单1001」处不成立
 _ORDER_RE = re.compile(r"(?<!\d)(\d{4,})(?!\d)")
+_DIRECT_HANDOFF = re.compile(r"(?:我[要想]|请(?:帮我)?|帮我)?(?:转(?:接)?|找|联系)人工(?:客服)?[。！？!?]*")
 
 
 def _extract_order_id(text: str) -> str | None:
@@ -118,10 +119,23 @@ async def script_reply(state) -> dict:
     return {"answer": text, "trace": {"route": "fallback_script"}}
 
 
+def transfer_action(state) -> dict:
+    message_id = next((m.id for m in reversed(state.get("messages", []))
+                       if isinstance(m, HumanMessage)), None)
+    if message_id and message_id.startswith("db-") and message_id[3:].isdigit():
+        return {"type": "transfer_human", "message_id": int(message_id[3:])}
+    return {"type": "transfer_human"}
+
+
+async def handoff_reply(state) -> dict:
+    return {"answer": "可以。请确认是否将本轮问题转给人工客服。",
+            "suggested_actions": [transfer_action(state)]}
+
+
 async def complaint_reply(state) -> dict:
     """投诉:安抚话术 + 转人工/建工单两个可选项(后端不执行,交前端自选)。"""
     actions = [
-        {"type": "transfer_human"},
+        transfer_action(state),
         {"type": "create_ticket",
          "draft": {"description": _user_text(state), "ticket_type": "投诉"}},
     ]
@@ -148,7 +162,7 @@ async def fallback_reply(state) -> dict:
         retrieved_chunks=snapshot,
     )
     return {"answer": FALLBACK_REPLY,
-            "suggested_actions": [{"type": "transfer_human"}],
+            "suggested_actions": [transfer_action(state)],
             "trace": {"route": "fallback"}}
 
 
@@ -156,6 +170,8 @@ async def resolve_reference(state) -> dict:
     """指代消解 + Query 改写(合一):吃最近几轮历史把半截话补成完整问句;已完整则透传。
     写 resolved_query,供 classify_intent 与 refund_flow 检索共用(意图识别不再改写)。"""
     query = _user_text(state)
+    if _DIRECT_HANDOFF.fullmatch(query.strip()):
+        return {"resolved_query": query, "trace": {"coref": "passthrough"}}
     history = _history_text(state)
     # ch07 验收可观测:每轮必经此节点,摘要行+滑窗在这一条日志里直接可见
     # (model_ctx 只在进 main_agent 的路由才有,闲聊/兜底路由靠这条看)
@@ -171,6 +187,10 @@ async def classify_intent(state) -> dict:
     判当前意图(应对物流→退款→物流漂移)。把归属出口 route 落进 State(供 _agent_messages 判注入、
     log 留痕;route_by_intent 条件边按同一 INTENT_TO_ROUTE 分流,单一来源不漂移)。"""
     query = state.get("resolved_query") or _user_text(state)
+    if _DIRECT_HANDOFF.fullmatch(_user_text(state).strip()):
+        tag_intent("人工", 1.0)
+        return {"intent": "人工", "intent_confidence": 1.0, "route": "handoff",
+                "trace": {"intent": "人工", "intent_confidence": 1.0, "route": "handoff"}}
     r = await intent_mod.classify(query, _history_text(state))
     intent, conf = r["intent"], r["confidence"]
     route = INTENT_TO_ROUTE.get(intent, "business")
@@ -450,6 +470,31 @@ async def log_node(state) -> dict:
     )
     answer = resolve_answer(state)
     if state.get("conversation_id"):
-        await repository.append_message(state["conversation_id"], "assistant",
-                                        content=answer or None)
+        offer = next((action for action in state.get("suggested_actions", [])
+                      if action.get("type") == "transfer_human" and action.get("message_id")), None)
+        evidence = state.get("retrieved_snapshot") or []
+        message_id = transfer_action(state).get("message_id")
+        if message_id and (offer or evidence):
+            user_id = state.get("user_id", "")
+            question = _user_text(state)
+            if state.get("route") == "handoff":
+                recent = await repository.list_dialog_messages(state["conversation_id"])
+                for previous in reversed(recent):
+                    if previous.role == "user" and previous.id < message_id and previous.content:
+                        if _DIRECT_HANDOFF.fullmatch(previous.content.strip()):
+                            continue
+                        question = previous.content
+                        evidence = (previous.handoff_context or {}).get("evidence", [])
+                        break
+            order_id = state.get("order_id") or _extract_order_id(question)
+            order = None
+            if order_id and business.owns_order(user_id, order_id):
+                order = next(row for row in business.list_user_orders(user_id)
+                             if row["order_id"] == order_id)
+            context = {"offered": bool(offer), "question": question[:4000],
+                       "order": order, "evidence": evidence}
+            await repository.append_message(state["conversation_id"], "assistant",
+                                            content=answer or None, handoff=(message_id, context))
+        else:
+            await repository.append_message(state["conversation_id"], "assistant", content=answer or None)
     return {}

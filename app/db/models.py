@@ -36,6 +36,7 @@ class Message(Base):
     role: Mapped[str] = mapped_column(Enum("user", "assistant", "tool"))
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     tool_calls: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    handoff_context: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
     tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -62,6 +63,9 @@ class Ticket(Base):
     )
     description: Mapped[str] = mapped_column(Text)
     submission_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    handoff_context: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    assigned_to: Mapped[str | None] = mapped_column(String(64))
+    resolution: Mapped[str | None] = mapped_column(Text)
     ticket_type: Mapped[str] = mapped_column(Enum("售后", "投诉", "咨询", "退款"))
     status: Mapped[str] = mapped_column(
         Enum("待处理", "已处理"), server_default="待处理"

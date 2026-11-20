@@ -49,6 +49,7 @@ async def append_message(
     content: str | None = None,
     tool_calls: list | None = None,
     tool_call_id: str | None = None,
+    *, handoff: tuple[int, dict] | None = None,
 ) -> int:
     async with db.async_session() as s:
         msg = Message(
@@ -59,6 +60,12 @@ async def append_message(
             tool_call_id=tool_call_id,
         )
         s.add(msg)
+        if handoff is not None:
+            message_id, context = handoff
+            await s.execute(update(Message).where(
+                Message.id == message_id, Message.conversation_id == conversation_id,
+                Message.role == "user", Message.handoff_context.is_(None),
+            ).values(handoff_context=context))
         await s.commit()
         return msg.id
 
@@ -75,6 +82,7 @@ async def list_messages(conversation_id: int) -> list[Message]:
 
 async def create_ticket(
     conversation_id: int, description: str, ticket_type: str, *, submission_key: str | None = None,
+    handoff_context: dict | None = None,
 ) -> str:
     ticket_no = _gen_ticket_no()
     async with db.async_session() as s:
@@ -95,6 +103,7 @@ async def create_ticket(
                 description=description,
                 ticket_type=ticket_type,
                 submission_key=submission_key,
+                handoff_context=handoff_context,
             )
         )
         if conv is not None:
@@ -108,6 +117,57 @@ async def get_ticket_result(conversation_id: int, submission_key: str) -> str | 
         return await s.scalar(select(Ticket.ticket_no).where(
             Ticket.conversation_id == conversation_id, Ticket.submission_key == submission_key,
         ))
+
+
+async def get_handoff_message(conversation_id: int, message_id: int) -> Message | None:
+    async with db.async_session() as s:
+        message = await s.scalar(select(Message).where(
+            Message.id == message_id, Message.conversation_id == conversation_id,
+            Message.role == "user", Message.handoff_context.is_not(None),
+        ))
+        return message if message and message.handoff_context.get("offered") else None
+
+
+async def get_handoff_ticket(ticket_no: str) -> Ticket | None:
+    async with db.async_session() as s:
+        return await s.scalar(select(Ticket).where(
+            Ticket.ticket_no == ticket_no, Ticket.handoff_context.is_not(None),
+        ))
+
+
+async def list_handoffs(*, conversation_id: int | None = None, status: str | None = None,
+                        limit: int = 50, offset: int = 0) -> list[Ticket]:
+    query = select(Ticket).where(Ticket.handoff_context.is_not(None))
+    if conversation_id is not None:
+        query = query.where(Ticket.conversation_id == conversation_id)
+    if status is not None:
+        query = query.where(Ticket.status == ("待处理" if status == "open" else "已处理"))
+    direction = Ticket.created_at.asc() if status == "open" else Ticket.created_at.desc()
+    async with db.async_session() as s:
+        return list((await s.scalars(query.order_by(
+            direction, Ticket.ticket_no,
+        ).limit(limit).offset(offset))).all())
+
+
+async def update_handoff(ticket_no: str, operator: str, resolution: str | None) -> Ticket:
+    async with db.async_session() as s, s.begin():
+        ticket = await s.get(Ticket, ticket_no, with_for_update=True)
+        if ticket is None or ticket.handoff_context is None:
+            raise LookupError(ticket_no)
+        if ticket.status == "已处理":
+            if ticket.assigned_to == operator and resolution is not None and ticket.resolution == resolution:
+                return ticket
+            raise SubmissionConflict
+        if ticket.assigned_to not in (None, operator):
+            raise SubmissionConflict
+        if resolution is None:
+            ticket.assigned_to = operator
+        elif ticket.assigned_to == operator:
+            ticket.status = "已处理"
+            ticket.resolution = resolution
+        else:
+            raise SubmissionConflict
+        return ticket
 
 
 # ---- ch07 会话上下文管理(滑窗 + 异步摘要)----
