@@ -184,8 +184,8 @@ async def retrieve_knowledge(state) -> dict:
     ch09 把 ch05 最简机械闸升级成正式置信度闸(四信号加权,阈值评估集校准),
     闸位不动:检索后、进 Agent 前。快照规则:只要走了检索就存 Top3 快照——
     闸不过随落池写库;闸都过留在 state 供事后 👎 回捞(踩的往往是「检到了但答砸」)。"""
-    query_raw = _user_text(state)
-    u = await query_understanding.understand(query_raw)
+    query = (state.get("resolved_query") or "").strip() or _user_text(state)
+    u = await query_understanding.understand(query)
     query = u["standard"]
     bm25_text = query + (" " + " ".join(u["expanded"]) if u["expanded"] else "")
 
@@ -348,18 +348,35 @@ async def agent_tools(state) -> dict:
     ticket_calls = [tc for tc in last.tool_calls if tc["name"] == "create_ticket"]
     tspec = specs.get("create_ticket")
     decision = None
+    confirmation_id = ""
     if ticket_calls and tspec is not None \
             and engine.validate_args(tspec, dict(ticket_calls[0].get("args") or {})) is None:
         first_args = ticket_calls[0]["args"]
+        confirmation_id = engine.ticket_confirmation_id(last.id or "", ticket_calls[0]["id"])
         decision = interrupt({"type": "confirm_ticket",
                               "preview": {"ticket_type": first_args.get("ticket_type", "咨询"),
-                                          "description": first_args.get("description", "")}})
+                                          "description": first_args.get("description", ""),
+                                          "confirmation_id": confirmation_id}})
 
     tool_msgs = []
     actions = list(state.get("suggested_actions", []))
     not_owned = False        # 这一轮有没有人报了不属于自己的订单号
     for tc in last.tool_calls:
-        if tc["name"] == "submit_refund":
+        name = tc["name"]
+        args = tc.get("args") or {}
+        spec = specs.get(name)
+        if spec is not None and spec.source == "mcp" and (
+            (name in {"query_warranty", "query_return_status"} and "order_id" in args
+             and not business.owns_order(uid, str(args["order_id"])))
+            or (name == "query_logistics" and "tracking_no" in args
+                and not business.owns_tracking_number(uid, str(args["tracking_no"])))
+        ):
+            not_owned = True
+            tool_msgs.append(ToolMessage(
+                content="没有找到这位用户的订单或运单，请引导用户核对自己的订单。",
+                tool_call_id=tc["id"], name=name, status="error",
+            ))
+        elif name == "submit_refund":
             # submit_refund 在这里就被拦成前端表单、不进执行引擎,所以工具内那道归属校验
             # 对它不生效,得在拦截之前判一次。不然退款入口就成了绕过校验的后门。
             if not business.owns_order(uid, str(tc["args"].get("order_id") or "")):
@@ -379,8 +396,10 @@ async def agent_tools(state) -> dict:
             if tc is ticket_calls[0]:
                 # resume 值形状守卫:同一 resume 端点服务两种中断,错配(如传了 order_id 字符串)
                 # 一律按未确认处理——宁可让用户重来,不让节点炸
-                if isinstance(decision, dict) and decision.get("confirmed"):
-                    run = await engine.execute_tool_call(tc, cid, specs, confirmed=True,
+                if (isinstance(decision, dict) and decision.get("confirmed")
+                        and decision.get("confirmation_id", confirmation_id) == confirmation_id):
+                    scoped_call = {**tc, "submission_scope": last.id or ""}
+                    run = await engine.execute_tool_call(scoped_call, cid, specs, confirmed=True,
                                                         user_id=uid)
                 else:
                     run = await engine.execute_tool_call(

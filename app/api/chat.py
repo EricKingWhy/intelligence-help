@@ -10,6 +10,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.auth import Principal, owned_conversation
 from app.graph import runtime
 from app.schemas.chat import ChatRequest
 
@@ -27,7 +28,10 @@ def _sse_error(message: str) -> AsyncIterator[str]:
 
 
 @router.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, principal: Principal):
+    await owned_conversation(principal, req.conversation_id)
+    if principal is not None:
+        req = req.model_copy(update={"user_id": principal[0]})
     async def event_stream() -> AsyncIterator[str]:
         try:
             async for ev in runtime.stream_turn(req.user_id, req.message, req.conversation_id):

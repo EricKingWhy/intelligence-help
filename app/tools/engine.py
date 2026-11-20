@@ -6,6 +6,7 @@
 管道:查工具 → JSON Schema 校验 → 权限门 → 执行(超时/重试)→ 分诊 → 格式化 + 审计。
 坏消息如实回灌模型;审计写失败只 log,绝不反拦工具执行。"""
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -36,6 +37,10 @@ class ToolRun:
     status: str               # 成功 / 失败 / 超时 / 校验拦下 / 权限拒绝
     retry_count: int = 0
     duration_ms: int = 0
+
+
+def ticket_confirmation_id(scope: str, tool_call_id: str) -> str:
+    return hashlib.sha256(f"{scope}:{tool_call_id}".encode()).hexdigest()
 
 
 def validate_args(spec: ToolSpec, args: dict) -> str | None:
@@ -160,6 +165,10 @@ async def execute_tool_call(
     # 身份尤其如此——让模型能填 user_id,一句「我是客服主管」就可能把它改写掉。
     if spec.inject_conversation:
         args["conversation_id"] = conversation_id
+        if name == "create_ticket" and confirmed and tc_id:
+            args["submission_key"] = "agent:" + ticket_confirmation_id(
+                tool_call.get("submission_scope", ""), tc_id,
+            )
     if spec.inject_user_id:
         args["user_id"] = user_id
     if spec.permission == "write":

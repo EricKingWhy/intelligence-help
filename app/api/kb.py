@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from app.core import jobs, retrieval
 from app.db import repository
+from app.db.models import KnowledgeChunk, QaExtractionStaging
 from app.kb import chunking, dedup, documents, dualwrite, milvus_client
 from app.kb.sources import CONTENT_TYPE_DESC, CONTENT_TYPES, KB_DIR, SOURCE_TYPES
 
@@ -286,7 +287,8 @@ async def staging(limit: int = 30) -> dict:
     rows = {}
     for st in ("extracted", "kept", "discarded", "approved", "rejected"):
         rows[st] = [{"id": r.id, "batch_no": r.batch_no, "source_ref": r.source_ref,
-                     "question": r.question, "answer": r.answer[:160]}
+                     "question": r.question, "answer": r.answer[:160],
+                     "publishing": st == "kept" and r.publication_chunk_id is not None}
                     for r in (await repository.list_staging_by_status(st))[:limit]]
     return {"stats": stats, "rows": rows}
 
@@ -297,46 +299,38 @@ class StagingReviewIn(BaseModel):
 
 @router.post("/staging/approve")
 async def staging_approve(body: StagingReviewIn) -> dict:
-    """人工采纳:选中的暂存行写进 knowledge_chunks 并向量化,成功才置 approved。
-
-    这是挖知识唯一的入库口。kb-mine 自己不写库——模型从聊天记录里归纳出来的问答对,
-    质量参差(只对单笔订单成立、夹带订单号、把「稍等我看看」当答案),得人过一眼。
-
-    只认 status='kept' 的行:重复点、或者拿已弃用的行来入库,都在这一步被挡掉。
-    向量化失败要把刚插入的 pending 行删掉再报错,不然重试会造出重复知识(同 review.py)。"""
-    rows = await repository.list_staging_by_ids(body.ids, status="kept")
-    if not rows:
-        raise HTTPException(status_code=409, detail="这些行不在待审状态(可能已被处理过)")
-
-    chunks = [documents.Chunk(category="历史对话", questions=r.question, answer=r.answer,
+    def make_chunk(row):
+        return KnowledgeChunk(category="历史对话", questions=row.question, answer=row.answer,
                               section_path="mined", content_type="mined",
-                              is_key_clause=documents.is_key(r.question, r.answer))
-              for r in rows]
-    ids: list[int] = []
-    try:
-        ids = await dualwrite.write_pending(chunks)
-        await dualwrite.vectorize_pending()
-    except Exception as e:
-        logger.exception("采纳写回知识库失败 staging=%s(状态不变,可重试)", [r.id for r in rows])
-        if ids:
-            try:
-                await repository.delete_knowledge_chunks(ids)
-            except Exception:
-                logger.exception("回滚 pending chunk 失败 ids=%s(需人工清理)", ids)
-        raise HTTPException(
-            status_code=502,
-            detail=f"写回知识库失败({type(e).__name__}),这几条仍是待审,修好嵌入/Milvus 再点一次") from e
+                              is_key_clause=documents.is_key(row.question, row.answer))
 
-    await repository.set_staging_status([r.id for r in rows], "approved")
-    logger.info("挖知识人工采纳 staging=%s → knowledge_chunks %s", [r.id for r in rows], ids)
-    return {"approved": len(rows), "chunk_ids": ids}
+    publications = {}
+    try:
+        rows = await repository.list_staging_by_ids(body.ids)
+        for row in rows:
+            try:
+                publications[row.id] = await repository.prepare_publication(
+                    QaExtractionStaging, row.id, make_chunk,
+                )
+            except repository.SubmissionConflict:
+                continue
+        if not publications:
+            raise HTTPException(409, "这些行无法采纳")
+        ids = list(publications.values())
+        await dualwrite.vectorize_pending(chunk_ids=ids)
+        for row_id, chunk_id in publications.items():
+            await repository.finish_publication(QaExtractionStaging, row_id, chunk_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("采纳写回未完成 staging=%s", body.ids)
+        raise HTTPException(502, "写回未完成，请选择同一批条目重试") from exc
+    return {"approved": len(ids), "chunk_ids": ids}
 
 
 @router.post("/staging/reject")
 async def staging_reject(body: StagingReviewIn) -> dict:
-    """人工弃用:不入库,只记结论。留着行不删,batch_no/source_ref 是溯源用的。"""
-    rows = await repository.list_staging_by_ids(body.ids, status="kept")
-    if not rows:
-        raise HTTPException(status_code=409, detail="这些行不在待审状态(可能已被处理过)")
-    await repository.set_staging_status([r.id for r in rows], "rejected")
-    return {"rejected": len(rows)}
+    rejected = await repository.reject_staging(body.ids)
+    if not rejected:
+        raise HTTPException(409, "这些行不在可驳回状态")
+    return {"rejected": rejected}

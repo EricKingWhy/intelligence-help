@@ -19,10 +19,12 @@ _DDL_FILES = [
     # 挖知识加人工闸:给 qa_extraction_staging 的 status 补 approved/rejected 两个终态
     pathlib.Path(__file__).resolve().parent.parent / "sql" / "ch03-staging-review.sql",
     pathlib.Path(__file__).resolve().parent.parent / "sql" / "ch04-ddl.sql",
+    pathlib.Path(__file__).resolve().parent.parent / "sql" / "ch06-ticket-type.sql",
     pathlib.Path(__file__).resolve().parent.parent / "sql" / "ch07-ddl.sql",
     pathlib.Path(__file__).resolve().parent.parent / "sql" / "ch08-ddl.sql",
     pathlib.Path(__file__).resolve().parent.parent / "sql" / "ch09-ddl.sql",
     pathlib.Path(__file__).resolve().parent.parent / "sql" / "ch10-ddl.sql",
+    pathlib.Path(__file__).resolve().parent.parent / "sql" / "ch11-reliability.sql",
 ]
 # 删除顺序:先子表后父表;knowledge_chunks 自引用 FK 靠 FOREIGN_KEY_CHECKS=0 兜
 # ch09:low_confidence_questions 有 FK 指向 review_queue,排它前面
@@ -34,6 +36,27 @@ _TABLES = ["faith_cases", "topic_classifications", "low_confidence_questions", "
 _TEST_URL = settings.test_database_url
 _DB_NAME = _TEST_URL.rsplit("/", 1)[1]
 _SERVER_URL = _TEST_URL.rsplit("/", 1)[0]
+
+
+def pytest_addoption(parser):
+    parser.addoption("--test-layer", choices=("quick", "integration"),
+                     help="Select tests without services or tests with MySQL/Milvus")
+
+
+def pytest_collection_modifyitems(config, items):
+    layer = config.getoption("--test-layer")
+    if layer is None:
+        return
+    service_fixtures = {"_test_engine", "coll", "milvus"}
+    integration_files = {"test_milvus_hybrid.py", "test_dualwrite_ch04.py"}
+    selected, deselected = [], []
+    for item in items:
+        requires_service = item.path.name in integration_files or bool(
+            service_fixtures.intersection(getattr(item, "fixturenames", ()))
+        )
+        (selected if requires_service == (layer == "integration") else deselected).append(item)
+    config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
 
 
 def _split_sql(sql: str) -> list[str]:

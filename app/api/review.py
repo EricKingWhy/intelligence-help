@@ -11,25 +11,21 @@ from fastapi import APIRouter, HTTPException
 
 from app.db import repository
 from app.kb import dualwrite
-from app.kb.documents import Chunk, is_key
+from app.db.models import KnowledgeChunk, ReviewQueue
+from app.kb.documents import is_key
 from app.schemas.review import ApproveRequest
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-async def _write_chunks(chunks: list[Chunk]) -> list[int]:
-    return await dualwrite.write_pending(chunks)
-
-
-async def _vectorize() -> int:
-    return await dualwrite.vectorize_pending()
-
-
 def _item_out(r) -> dict:
+    publishing = r.review_status == "待审" and r.publication_chunk_id is not None
     return {"id": r.id, "normalized_question": r.normalized_question,
             "ai_suggested_answer": r.ai_suggested_answer,
             "occurrence_count": r.occurrence_count, "review_status": r.review_status,
+            "publishing": publishing,
+            "publication_answer": r.approved_answer if publishing else None,
             "created_at": r.created_at.isoformat() if r.created_at else None}
 
 
@@ -58,39 +54,27 @@ async def review_detail(review_id: int) -> dict:
 
 @router.post("/api/review/{review_id}/approve")
 async def approve(review_id: int, req: ApproveRequest) -> dict:
-    detail = await repository.get_review_detail(review_id)
-    if detail is None:
-        raise HTTPException(status_code=404, detail="缺口不存在")
-    item, _ = detail
-    if item.review_status != "待审":
-        raise HTTPException(status_code=409, detail=f"当前状态为「{item.review_status}」,不可再审")
+    def make_chunk(item):
+        return KnowledgeChunk(
+            category="飞轮沉淀", questions=item.normalized_question, answer=req.approved_answer,
+            section_path=f"飞轮沉淀 / {item.normalized_question}"[:512], content_type="faq",
+            is_key_clause=is_key(item.normalized_question, req.approved_answer),
+        )
 
-    chunk = Chunk(
-        category="飞轮沉淀", questions=item.normalized_question, answer=req.approved_answer,
-        section_path=f"飞轮沉淀 / {item.normalized_question}", content_type="faq",
-        is_key_clause=is_key(item.normalized_question, req.approved_answer),
-    )
-    chunk_ids: list[int] = []
     try:
-        chunk_ids = await _write_chunks([chunk])
-        await _vectorize()
-    except Exception:
-        logger.exception("审核写回知识库失败 review=%s(状态保持待审,可重试)", review_id)
-        if chunk_ids:
-            # 回滚本次插入的 pending 行:vectorize_pending 处理全部 pending,
-            # 残留会让重试造出重复知识条目(spec 8.2「整体回滚」)
-            try:
-                await repository.delete_knowledge_chunks(chunk_ids)
-            except Exception:
-                logger.exception("回滚 pending chunk 失败 ids=%s(需人工清理)", chunk_ids)
-        raise HTTPException(status_code=502, detail="写回知识库失败(检查嵌入上游/Milvus),状态未变可重试")
-
-    if not await repository.update_review_status(review_id, "通过", approved_answer=req.approved_answer):
-        # 并发窗口:KB 已写入但状态被他人先变更——如实报出,不装成功
-        logger.warning("审核状态更新落空(并发变更?)review=%s,KB 已写入 %s", review_id, chunk_ids)
-        raise HTTPException(status_code=409, detail="状态已被他人变更;知识已写入,请人工核对")
-    logger.info("审核通过 review=%s → knowledge_chunks %s(已向量化,下一问可检索)", review_id, chunk_ids)
-    return {"ok": True, "chunk_ids": chunk_ids}
+        chunk_id = await repository.prepare_publication(
+            ReviewQueue, review_id, make_chunk, answer=req.approved_answer,
+        )
+        await dualwrite.vectorize_pending(chunk_ids=[chunk_id])
+        await repository.finish_publication(ReviewQueue, review_id, chunk_id)
+    except LookupError as exc:
+        raise HTTPException(404, "缺口不存在") from exc
+    except repository.SubmissionConflict as exc:
+        raise HTTPException(409, "审核状态或已登记的答案发生冲突") from exc
+    except Exception as exc:
+        logger.exception("审核写回未完成 review=%s", review_id)
+        raise HTTPException(502, "写回未完成，请使用相同答案重试") from exc
+    return {"ok": True, "chunk_ids": [chunk_id]}
 
 
 @router.post("/api/review/{review_id}/reject")

@@ -61,6 +61,7 @@ class Ticket(Base):
         BigInteger, ForeignKey("conversations.id")
     )
     description: Mapped[str] = mapped_column(Text)
+    submission_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ticket_type: Mapped[str] = mapped_column(Enum("售后", "投诉", "咨询", "退款"))
     status: Mapped[str] = mapped_column(
         Enum("待处理", "已处理"), server_default="待处理"
@@ -98,6 +99,7 @@ class QaExtractionStaging(Base):
     source_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     question: Mapped[str] = mapped_column(Text)
     answer: Mapped[str] = mapped_column(Text)
+    publication_chunk_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(
         # kept 是「去重保留、等人审」,不是「已入库」;入库只走 /api/kb/staging/approve
         Enum("extracted", "kept", "discarded", "approved", "rejected"),
@@ -150,6 +152,7 @@ class ReviewQueue(Base):
     occurrence_count: Mapped[int] = mapped_column(Integer, server_default="1")
     review_status: Mapped[str] = mapped_column(Enum("待审", "通过", "驳回"), server_default="待审")
     approved_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    publication_chunk_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

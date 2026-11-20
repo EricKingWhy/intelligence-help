@@ -1,0 +1,39 @@
+name: Tests
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  CHAT_MODEL: test-model
+  CHAT_BASE_URL: http://127.0.0.1:1/v1
+  CHAT_API_KEY: test-placeholder
+  EMBED_API_KEY: test-placeholder
+  RERANK_API_KEY: test-placeholder
+  TEST_DATABASE_URL: mysql+asyncmy://root:root@127.0.0.1:3306/mewhelp_ci_test
+  COMPOSE_FILE: docker-compose.yml:docker-compose.test.yml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        layer: [quick, integration]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - if: matrix.layer == 'integration'
+        run: docker compose up -d --wait --wait-timeout 300 mysql milvus-standalone
+      - name: Run tests
+        run: uv run --locked pytest -ra --test-layer=${{ matrix.layer }}
+      - if: failure() && matrix.layer == 'integration'
+        run: docker compose logs --tail=100
+      - if: always() && matrix.layer == 'integration'
+        run: docker compose down --volumes

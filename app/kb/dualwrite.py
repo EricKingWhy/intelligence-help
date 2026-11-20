@@ -30,17 +30,25 @@ def _batches(items: list, size: int):
         yield items[i:i + size]
 
 
-async def vectorize_pending(client=None, batch_size: int = 64, collection: str = milvus_client.COLLECTION) -> int:
+async def vectorize_pending(
+    client=None, batch_size: int = 64, collection: str = milvus_client.COLLECTION,
+    *, chunk_ids: list[int] | None = None,
+) -> int:
     """幂等可重跑:取 pending → 拼 category+questions+answer → 嵌入 + BM25 text → Milvus upsert(PK=id)
     → 回填 vector_id、status=done。
     ch09:client 缺省时在 Milvus 专用线程内惰性创建,upsert/flush 也走 acall——
     server 进程(审核通过写回)与脚本两个场景共用一条安全路径(gRPC 客户端跨线程
     共享在 async server 下会间歇空返回,见 retrieval.py 注)。"""
-    pending = await repository.list_pending_chunks()
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    pending = (await repository.list_pending_chunks() if chunk_ids is None
+               else await repository.list_pending_chunks(chunk_ids))
     done = 0
     for batch in _batches(pending, batch_size):
         texts = [f"{r.category}\n{r.questions}\n{r.answer}" for r in batch]
         vectors = await embeddings.embed_texts(texts)
+        if len(vectors) != len(batch):
+            raise ValueError(f"Expected {len(batch)} embeddings, received {len(vectors)}")
         rows = [
             {"id": r.id, "dense": v, "text": t,
              "question": r.questions, "answer": r.answer,
@@ -49,17 +57,13 @@ async def vectorize_pending(client=None, batch_size: int = 64, collection: str =
             for r, v, t in zip(batch, vectors, texts)
         ]
 
-        def work_upsert(rows=rows):
+        def write_batch():
             c = client or milvus_client.get_client()
             milvus_client.ensure_collection(c, collection=collection)
             milvus_client.upsert_vectors(c, rows, collection=collection)
-        await milvus_client.acall(work_upsert)
+            milvus_client.flush(c, collection=collection)
+        await milvus_client.acall(write_batch)
         for r in batch:
             await repository.mark_chunk_vectorized(r.id, str(r.id))
         done += len(batch)
-    if done:
-        def work_flush():
-            c = client or milvus_client.get_client()
-            milvus_client.flush(c, collection=collection)  # 刷盘,数据方可被 BM25 检索
-        await milvus_client.acall(work_flush)
     return done

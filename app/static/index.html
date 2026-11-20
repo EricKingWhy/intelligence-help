@@ -903,6 +903,17 @@
       if (e.key === "Escape" && ticketMask.classList.contains("open")) closeTicketModal();
     });
 
+    const pendingSubmissions = new WeakMap();
+
+    function submissionHeaders(button, body) {
+      const previous = pendingSubmissions.get(button);
+      const key = previous?.body === body ? previous.key :
+        Array.from(crypto.getRandomValues(new Uint8Array(16)),
+          n => n.toString(16).padStart(2, "0")).join("");
+      pendingSubmissions.set(button, { body, key });
+      return { "Content-Type": "application/json", "Idempotency-Key": key };
+    }
+
     ticketSubmit.addEventListener("click", async () => {
       const type = ticketType.value;
       const desc = ticketDesc.value.trim();
@@ -912,16 +923,16 @@
       ticketSubmit.disabled = true;
       ticketSubmit.textContent = "提交中…";
       try {
+        const button = ticketTriggerBtn || ticketSubmit;
+        const body = JSON.stringify({
+          conversation_id: getConversationId(), description: desc, ticket_type: type,
+        });
         const resp = await fetch("/api/actions/create-ticket", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            conversation_id: getConversationId(),
-            description: desc,
-            ticket_type: type,
-          }),
+          method: "POST", headers: submissionHeaders(button, body), body,
         });
         const data = await resp.json();
         if (resp.ok) {
+          pendingSubmissions.delete(button);
           if (ticketTriggerBtn) ticketTriggerBtn.disabled = true;  // 建成后该气泡的按钮置灰
           closeTicketModal();
           addRow("bot").textContent = "工单已创建:" + data.ticket_no;
@@ -969,13 +980,15 @@
       refundSubmit.disabled = true;
       refundSubmit.textContent = "提交中…";
       try {
+        const button = refundTriggerBtn || refundSubmit;
+        const body = JSON.stringify({ conversation_id: getConversationId(),
+          order_id: refundOrder.value, reason });
         const resp = await fetch("/api/actions/create-refund", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ conversation_id: getConversationId(),
-            order_id: refundOrder.value, reason }),
+          method: "POST", headers: submissionHeaders(button, body), body,
         });
         const data = await resp.json();
         if (resp.ok) {
+          pendingSubmissions.delete(button);
           if (refundTriggerBtn) refundTriggerBtn.disabled = true;
           closeRefundModal();
           addRow("bot").textContent = "退款申请已提交:" + data.ticket_no;
@@ -1072,11 +1085,13 @@
           try {
             await streamInto(nb, () => fetch("/api/actions/resume", {
               method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ conversation_id: getConversationId(), confirmed }),
+              body: JSON.stringify({ conversation_id: getConversationId(), confirmed,
+                confirmation_id: preview.confirmation_id }),
             }));
           } catch (e) {
             nb.className = "bubble error";
             nb.textContent = "续跑失败,请稍后重试";
+            btns.querySelectorAll("button").forEach((b) => (b.disabled = false));
           } finally {
             setBusy(false);
           }

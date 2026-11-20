@@ -9,6 +9,7 @@ import logging
 from fastapi import APIRouter
 
 from app.db import repository
+from app.api.auth import Principal, owned_conversation
 from app.graph import runtime
 from app.schemas.feedback import FeedbackRequest, FeedbackResponse
 
@@ -21,7 +22,8 @@ def _same_question(a: str, b: str) -> bool:
 
 
 @router.post("/api/feedback", response_model=FeedbackResponse)
-async def submit_feedback(req: FeedbackRequest) -> FeedbackResponse:
+async def submit_feedback(req: FeedbackRequest, principal: Principal) -> FeedbackResponse:
+    await owned_conversation(principal, req.conversation_id)
     if req.rating == "up":
         logger.info("feedback up conv=%s q=%r(只记日志,不落库)", req.conversation_id, req.question[:40])
         return FeedbackResponse(pooled=False)

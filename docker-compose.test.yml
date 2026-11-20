@@ -1,0 +1,18 @@
+# Empty-volume demo and CI setup. Do not reuse a Milvus volume created with MinIO.
+services:
+  milvus-standalone:
+    depends_on: !reset []
+    environment:
+      ETCD_ENDPOINTS: !reset null
+      MINIO_ADDRESS: !reset null
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      COMMON_STORAGETYPE: local
+      DEPLOY_MODE: STANDALONE
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - mewhelp-milvus-local-data:/var/lib/milvus
+
+volumes:
+  mewhelp-milvus-local-data:

@@ -2,6 +2,7 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
+import asyncio
 import uuid
 
 import pytest
@@ -33,6 +34,41 @@ async def test_write_pending_links_neighbors(db_session_factory):
     assert by_id[ids[1]].prev_chunk_id == ids[0]
     assert by_id[ids[1]].next_chunk_id == ids[2]
     assert by_id[ids[0]].prev_chunk_id is None
+
+
+@pytest.mark.parametrize("stage", ["upsert_vectors", "flush", "mark_chunk_vectorized"])
+async def test_vector_write_failure_can_be_retried(db_session_factory, milvus, monkeypatch, stage):
+    client, name = milvus
+    ids = await dualwrite.write_pending([_chunk("保修政策", "整机保修一年"), _chunk("其他", "待处理")])
+
+    async def embed(texts):
+        return [[0.05] * milvus_client.DIM for _ in texts]
+
+    target = repository if stage == "mark_chunk_vectorized" else milvus_client
+    original = getattr(target, stage)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(dualwrite.embeddings, "embed_texts", embed)
+    monkeypatch.setattr(target, stage, fail)
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        await dualwrite.vectorize_pending(client, collection=name, chunk_ids=ids[:1])
+    assert await repository.count_chunks_by_status("pending") == 2
+
+    monkeypatch.setattr(target, stage, original)
+    assert await dualwrite.vectorize_pending(client, collection=name, chunk_ids=ids[:1]) == 1
+    assert await repository.count_chunks_by_status("pending") == 1
+    client.load_collection(name)
+    for _ in range(10):
+        hits = await milvus_client.acall(
+            lambda: milvus_client.bm25_search(client, "保修政策", top_k=2, collection=name),
+        )
+        if ids[0] in [hit["id"] for hit in hits]:
+            break
+        await asyncio.sleep(0.3)
+    else:
+        pytest.fail("Recovered knowledge chunk did not become searchable")
 
 
 async def test_vectorize_resumes_after_crash(db_session_factory, milvus, monkeypatch):
