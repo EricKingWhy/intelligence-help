@@ -9,6 +9,8 @@ cp .env.example .env
 
 在 `.env` 填写聊天模型和聊天、嵌入、重排的端点及密钥。以示例文件中的变量名为准。把 `CHAT_API_KEY`、`EMBED_API_KEY`、`RERANK_API_KEY` 分别配置为可用密钥。以下使用本地 Milvus，`MILVUS_URI` 指向 `http://localhost:19530`。
 
+聊天端点需要支持 OpenAI 兼容的 Function Calling。如果日志出现流式响应缺少 `tool_calls`，可在启动应用前执行 `export MEWHELP_TOOL_STREAMING=off` 测试该端点的非流式工具调用。
+
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait --wait-timeout 300 mysql milvus-standalone
 make seed
@@ -27,6 +29,8 @@ uv run uvicorn app.main:app --port 8000
 | 订单 1001 的物流到哪了？ | 出现订单及物流查询标记，回答物流状态。 |
 | 退货政策是什么？ | 回答七天无理由及适用条件，带可展开的对应政策引用。 |
 | 火星车能参加以旧换新吗？ | 明确说明无法从现有知识确认，给出兜底。 |
+
+也可以运行 `uv run python -m scripts.smoke_customer`，通过现有聊天 SSE 接口检查三项结果。
 
 本地运行 `make test-quick` 检查无外部服务的回归。数据库容器就绪后用 `make test-integration` 跑真实 MySQL 和 Milvus 测试，`TEST_DATABASE_URL` 务必指向独立的测试库。更多启动排查见 [部署说明](../DEPLOY.md)。
 

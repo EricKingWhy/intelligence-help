@@ -15,7 +15,7 @@ from app.core import intent as intent_mod
 from app.core import memory
 from app.core import query_understanding, retrieval, selfcheck
 from app.core.confidence import compute_evidence_confidence, snapshot_from_hits
-from app.core.llm import get_chat_model
+from app.core.llm import force_non_streaming_tools, get_chat_model
 from app.core.observability import tag_intent
 from app.core.prompts import (
     AGENT_SYSTEM, COMPLAINT_REPLY_TEXT, FALLBACK_REPLY_TEXT,
@@ -317,7 +317,9 @@ async def main_agent(state, config=None) -> dict:
     注:streaming=True 下 ChatOpenAI 默认不回传 usage_metadata;usage 回传已在
     get_chat_model 统一收口(ch09 stream_usage=True),这里不再单独 bind。"""
     specs = await registry.get_all_specs()   # ch08 现问现拿:内置+MCP 合并清单,每轮现拉
-    model = get_chat_model(streaming=True).bind_tools([s.tool for s in specs])
+    model = get_chat_model(streaming=not force_non_streaming_tools()).bind_tools(
+        [s.tool for s in specs],
+    )
     msgs = _agent_messages(state)
     _log_model_context(state, msgs)   # ch07:摘要+滑窗进日志,验收 tail -f 可见
     ai: AIMessage = await model.ainvoke(msgs, config)

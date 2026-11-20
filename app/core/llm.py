@@ -3,6 +3,7 @@
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
 import logging
+import os
 
 from langchain_core.exceptions import OutputParserException
 from langchain_openai import ChatOpenAI
@@ -74,6 +75,7 @@ def get_chat_model(streaming: bool = False, model: str | None = None,
         base_url=settings.chat_base_url,
         api_key=settings.chat_api_key,
         streaming=streaming,
+        disable_streaming=not streaming and force_non_streaming_tools(),
         stream_usage=True,
         temperature=0.3 if temperature is None else temperature,
         **_thinking_kwargs(),
@@ -135,7 +137,11 @@ _NO_STREAM_TOOLCALL_FAMILIES: tuple[str, ...] = ("minimax",)
 
 def needs_non_streaming_tools(model: str | None = None) -> bool:
     name = (model or settings.chat_model or "").lower()
-    return any(f in name for f in _NO_STREAM_TOOLCALL_FAMILIES)
+    return force_non_streaming_tools() or any(f in name for f in _NO_STREAM_TOOLCALL_FAMILIES)
+
+
+def force_non_streaming_tools() -> bool:
+    return os.environ.get("MEWHELP_TOOL_STREAMING") == "off"
 
 
 def structured(schema, *, model: str | None = None, streaming: bool = True,
