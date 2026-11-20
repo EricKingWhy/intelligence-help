@@ -2,6 +2,8 @@
 
 ## RAG 四策略
 
+302 道题的全量对照见[评测报告](../data/ch04/reports/rag_tradeoffs_full.md)，包括按问题类型的质量、延迟和成本数据。
+
 先按 [快速启动](quickstart.md) 写入测试知识库，再指定这次索引对应的知识快照：
 
 ```bash
