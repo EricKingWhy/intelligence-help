@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.core import llm
+from app.core.upstream import failure
 from app.core.llm import get_chat_model
 from app.core.prompts import INTENT_CLASSIFY_PROMPT
 
@@ -28,7 +29,7 @@ async def classify(query: str, history: str = "") -> dict:
     try:
         r: _Intent = await (INTENT_CLASSIFY_PROMPT | model).ainvoke(
             {"query": query, "history": history or "(无)"})
-    except Exception:
-        return {"intent": "其他", "confidence": 0.0}
+    except Exception as exc:
+        return {"intent": "其他", "confidence": 0.0, "service_failure": failure(exc, "intent")}
     intent = r.intent if r.intent in INTENTS else "其他"
     return {"intent": intent, "confidence": float(r.confidence)}

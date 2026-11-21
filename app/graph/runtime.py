@@ -68,7 +68,10 @@ async def get_turn_snapshot(conversation_id: int) -> dict:
         if getattr(m, "type", "") == "human":
             question = m.content if isinstance(m.content, str) else ""
             break
-    return {"question": question, "snapshot": values.get("retrieved_snapshot") or []}
+    snapshot = {"question": question, "snapshot": values.get("retrieved_snapshot") or []}
+    if values.get("service_failure"):
+        snapshot["service_failure"] = values["service_failure"]
+    return snapshot
 
 
 def dedup_actions(actions: list) -> list:
@@ -105,7 +108,7 @@ def _graph_input(user_id: str, message: str, cid: int, msg_id: int,
             "conversation_id": cid, "steps": 0, "tokens_used": 0,
             "answer": "", "suggested_actions": [], "evidence": "",
             "evidence_strong": False, "citations": [],
-            "evidence_confidence": 0.0, "fallback_source": "", "retrieved_snapshot": [],
+            "evidence_confidence": 0.0, "fallback_source": "", "retrieved_snapshot": [], "service_failure": None,
             "resolved_query": "", "intent_confidence": 0.0,
             "order_id": "", "order_data": {},
             "summary": summary, "summary_upto_msg_id": summary_upto,
@@ -178,7 +181,10 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
                 if not isinstance(upd, dict):
                     continue
                 if node in DETERMINISTIC_ANSWER_NODES and upd.get("answer"):
-                    yield {"type": "delta", "text": upd["answer"]}
+                    event = {"type": "delta", "text": upd["answer"]}
+                    if node == "fallback_reply" and upd.get("trace", {}).get("service_failure"):
+                        event["replace"] = True
+                    yield event
                 if node in CITATION_NODES and upd.get("citations"):
                     yield {"type": "citations", "items": upd["citations"]}
                 if node == "agent_tools":

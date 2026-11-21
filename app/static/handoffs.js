@@ -55,6 +55,14 @@ function renderItem(item, operator, open) {
   body.append(element("p", "会话 #" + item.conversation_id
     + (item.assigned_to ? " · 处理人 " + item.assigned_to : ""), "handoff-meta"));
   body.append(element("h2", "客户问题"), element("p", item.description));
+  if (item.context.service_failure) {
+    const descriptions = {
+      rate_limited: "上游限流", timeout: "查询超时",
+      knowledge_unavailable: "知识库不可用", unavailable: "上游服务不可用",
+    };
+    body.append(element("h2", "转接原因"), element("p",
+      descriptions[item.context.service_failure.kind] || "查询中断"));
+  }
   const order = item.context.order;
   body.append(element("h2", "关联订单"), element("p", order
     ? [order.order_id, order.product, order.status].filter(Boolean).join(" · ")

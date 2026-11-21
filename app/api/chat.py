@@ -38,7 +38,7 @@ async def chat(req: ChatRequest, principal: Principal):
                 if ev["type"] == "tool":
                     yield _sse({"event": "tool", "name": ev["name"]})
                 elif ev["type"] == "delta":
-                    yield _sse({"delta": ev["text"]})
+                    yield _sse({"delta": ev["text"], **({"replace": True} if ev.get("replace") else {})})
                 elif ev["type"] == "citations":
                     yield _sse({"event": "citations", "items": ev["items"]})
                 elif ev["type"] == "interrupt":

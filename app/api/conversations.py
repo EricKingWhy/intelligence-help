@@ -28,6 +28,9 @@ async def list_messages(conversation_id: int, principal: Principal):
     return {"items": [
         {"role": m.role, "content": m.content or "",
          "created_at": m.created_at.isoformat() if m.created_at else None,
-         **({"handoff_message_id": m.id} if (m.handoff_context or {}).get("offered") else {})}
+         **({"handoff_message_id": m.id} if (m.handoff_context or {}).get("offered") else {}),
+         **({"retryable": True} if m.role == "user" and (m.handoff_context or {}).get("retryable") else {}),
+         **({"service_failed": True} if m.role == "assistant"
+            and (m.handoff_context or {}).get("service_failure") else {})}
         for m in msgs
     ]}
