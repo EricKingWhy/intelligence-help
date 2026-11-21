@@ -40,12 +40,13 @@ def predict(model, tokenizer, texts: list[str], threshold: float, device: str) -
     return apply_threshold(np.concatenate(probs_all), threshold)
 
 
-def main() -> None:
+def main(*, samples=None, reports=REPORTS, dataset_metadata=None) -> None:
     device = pick_device()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).to(device)
     threshold = json.loads((MODEL_DIR / "threshold.json").read_text())["threshold"]
-    samples = [json.loads(l) for l in TEST.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if samples is None:
+        samples = [json.loads(l) for l in TEST.read_text(encoding="utf-8").splitlines() if l.strip()]
     texts = [s["text"] for s in samples]
     gold = np.zeros((len(samples), NUM_CLASSES), dtype=int)
     for i, s in enumerate(samples):
@@ -60,7 +61,7 @@ def main() -> None:
         gold, preds, average="macro", zero_division=0)
     cms = multilabel_confusion_matrix(gold, preds)
 
-    REPORTS.mkdir(parents=True, exist_ok=True)
+    reports.mkdir(parents=True, exist_ok=True)
     lines = ["# ch10 分类器评测报告(留出测试集)", "",
              f"测试集 {len(samples)} 条;判定阈值 {threshold}(验证集扫描所得)。", "",
              f"**micro**: P={micro_p:.3f} R={micro_r:.3f} F1={micro_f1:.3f}  |  "
@@ -83,23 +84,23 @@ def main() -> None:
         tn, fp = cms[i][0]
         fn, tp = cms[i][1]
         lines.append(f"- **{name}**: TN={tn} FP={fp} FN={fn} TP={tp}")
-    (REPORTS / "eval_report.md").write_text("\n".join(lines), encoding="utf-8")
-
     err = ["# ch10 判错样本(人工复核:错在哪一类?标注本身有没有毛病?)", ""]
     errors: list[dict] = []
     for i, s in enumerate(samples):
         pred_labels = [TOPIC_NAMES[j] for j in range(NUM_CLASSES) if preds[i][j]]
         if set(pred_labels) != set(s["labels"]):
-            err.append(f"- {s['text']}\n  标准: {s['labels']}  预测: {pred_labels}")
+            sample_ref = s["id"] if dataset_metadata is not None else s["text"]
+            err.append(f"- {sample_ref}\n  标准: {s['labels']}  预测: {pred_labels}")
             # 错误方向性:漏打只记放跑、多打只记冤枉、错位两头都记——错例条数与矩阵笔数
             # 对不上就是从这来的(验收页要把这笔账摊开,别让读者自己减)
             missed = [lb for lb in s["labels"] if lb not in pred_labels]
             extra = [lb for lb in pred_labels if lb not in s["labels"]]
             kind = "错位" if missed and extra else ("漏打" if missed else "多打")
-            errors.append({"text": s["text"], "gold": list(s["labels"]), "pred": pred_labels,
+            reference = {"id": sample_ref, "bucket": s["bucket"]} if dataset_metadata else {"text": sample_ref}
+            errors.append({**reference, "gold": list(s["labels"]), "pred": pred_labels,
                            "missed": missed, "extra": extra, "kind": kind,
                            "matrix_entries": len(missed) + len(extra)})
-    (REPORTS / "error_samples.md").write_text("\n".join(err), encoding="utf-8")
+    (reports / "error_samples.md").write_text("\n".join(err), encoding="utf-8")
 
     report = {
         "ran_at": dt.datetime.now().isoformat(timespec="seconds"),
@@ -128,10 +129,34 @@ def main() -> None:
     report["total_fp"] = sum(c["fp"] for c in report["classes"])
     report["total_fn"] = sum(c["fn"] for c in report["classes"])
     report["red_line_passed"] = all(c["passed"] is not False for c in report["classes"])
-    (REPORTS / "eval_report.json").write_text(
+    if dataset_metadata:
+        from collections import Counter
+
+        report["dataset"] = dataset_metadata
+        report["buckets"] = {}
+        for bucket in sorted({s["bucket"] for s in samples}):
+            indices = [i for i, s in enumerate(samples) if s["bucket"] == bucket]
+            report["buckets"][bucket] = {
+                "n": len(indices),
+                **{f"{average}_f1": float(precision_recall_fscore_support(
+                    gold[indices], preds[indices], average=average, zero_division=0,
+                )[2]) for average in ("micro", "macro")},
+            }
+        baseline = json.loads((REPORTS / "eval_report.json").read_text(encoding="utf-8"))
+        report["baseline_f1_delta"] = {average: report[average]["f1"] - baseline[average]["f1"]
+                                       for average in ("micro", "macro")}
+        report["missed_labels"] = Counter(label for error in errors for label in error["missed"])
+        report["extra_labels"] = Counter(label for error in errors for label in error["extra"])
+        for cls in report["classes"]:
+            cls["limited_support"] = cls["support"] < 10
+        lines += ["", "## 真实留出集", "",
+                  f"版本 {dataset_metadata['version']}。每类少于 10 条正例时，指标需结合样本数解释。",
+                  f"对既有报告的 F1 差异 {report['baseline_f1_delta']}。"]
+    (reports / "eval_report.md").write_text("\n".join(lines), encoding="utf-8")
+    (reports / "eval_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"micro-F1 {micro_f1:.4f} / macro-F1 {macro_f1:.4f};"
-          f"报告与判错样本已落 {REPORTS}/(.md + .json)")
+          f"报告与判错样本已落 {reports}/(.md + .json)")
 
 
 if __name__ == "__main__":

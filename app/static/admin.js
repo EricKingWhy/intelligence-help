@@ -13,6 +13,7 @@
 (function () {
   const NAV = [
     { href: "/admin", label: "后台首页" },
+    { href: "/handoffs", label: "人工工单" },
     { href: "/kb", label: "知识库录入" },
     { href: "/rag-eval", label: "RAG 评估" },
     { href: "/review", label: "飞轮待审" },

@@ -19,6 +19,7 @@ def _builder() -> StateGraph:
     b.add_node("main_agent", nodes.main_agent)
     b.add_node("agent_tools", nodes.agent_tools)
     b.add_node("complaint_reply", nodes.complaint_reply)
+    b.add_node("handoff_reply", nodes.handoff_reply)
     b.add_node("script_reply", nodes.script_reply)
     b.add_node("fallback_reply", nodes.fallback_reply)
     b.add_node("fetch_order", nodes.fetch_order)
@@ -30,6 +31,7 @@ def _builder() -> StateGraph:
     b.add_edge("resolve_reference", "classify_intent")
     b.add_conditional_edges("classify_intent", route_by_intent, {
         "escalate": "complaint_reply",
+        "handoff": "handoff_reply",
         "fallback_script": "script_reply",
         "knowledge": "retrieve_knowledge",
         "refund_flow": "fetch_order",
@@ -52,6 +54,7 @@ def _builder() -> StateGraph:
     b.add_edge("agent_tools", "main_agent")
     # 确定性出口 → 日志 → END
     b.add_edge("complaint_reply", "log")
+    b.add_edge("handoff_reply", "log")
     b.add_edge("script_reply", "log")
     b.add_edge("fallback_reply", "log")
     b.add_edge("log", END)

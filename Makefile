@@ -122,6 +122,12 @@ seed:
 test:
 	uv run pytest -v
 
+test-quick:
+	uv run pytest -ra --test-layer=quick
+
+test-integration:
+	uv run pytest -ra --test-layer=integration
+
 eval:
 	uv run python scripts/eval_extract.py
 

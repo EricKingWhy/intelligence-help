@@ -3,9 +3,11 @@
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
 from app.graph import nodes
+from app.graph.build import build_graph
 
 
 @pytest.mark.asyncio
@@ -33,6 +35,39 @@ async def test_forced_rag_weak_when_below_threshold(monkeypatch):
     out = await nodes.retrieve_knowledge({"messages": [HumanMessage("怎么注销账号")]})
     assert out["evidence_strong"] is False
     assert out["trace"]["forced_rag"] is True
+
+
+async def test_forced_rag_uses_product_from_previous_turn(monkeypatch):
+    async def understand(query):
+        return {"standard": query, "expanded": []}
+
+    async def resolve(query, history):
+        if query == "那它有保修吗？" and "Pro 猫砂盆" in history:
+            return "Pro 猫砂盆有保修吗？"
+        return query
+
+    async def search(query, **kwargs):
+        if "Pro 猫砂盆" not in query:
+            return []
+        return [{"id": 17, "question": "Pro 猫砂盆保修", "answer": "整机保修一年",
+                 "rerank_score": 0.95, "section_path": "Pro / 保修", "content_type": "policy"}]
+
+    monkeypatch.setattr(nodes.coref, "resolve", resolve)
+    monkeypatch.setattr(nodes.intent_mod, "classify",
+                        _aval({"intent": "商品咨询", "confidence": 0.95}))
+    monkeypatch.setattr(nodes.query_understanding, "understand", understand)
+    monkeypatch.setattr(nodes.retrieval, "search_knowledge", search)
+    monkeypatch.setattr(nodes.selfcheck, "check_sufficient", _aval({"useful": True, "reason": ""}))
+    monkeypatch.setattr(nodes, "main_agent",
+                        _aval({"messages": [AIMessage("依据[1]，整机保修一年")]}))
+    graph = build_graph(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "customer"}}
+    first = await graph.ainvoke({"messages": [HumanMessage("Pro 猫砂盆整机保修多久？")]}, config)
+    assert first["citations"][0]["id"] == 17
+    second = await graph.ainvoke({"messages": [HumanMessage("那它有保修吗？")], "citations": []}, config)
+    assert second["evidence_strong"] is True
+    assert second["citations"][0]["id"] == 17
+    assert "[1]" in nodes.resolve_answer(second)
 
 
 @pytest.mark.asyncio

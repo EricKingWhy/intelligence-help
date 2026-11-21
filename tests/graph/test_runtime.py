@@ -195,7 +195,10 @@ async def test_resume_turn_drives_command(monkeypatch, no_summary_task):
             seen["resume"] = getattr(inp, "resume", None)
             return {"answer": "这一单可以退款", "messages": []}
 
-    async def fake_get(cid): return object()
+    async def fake_get(cid):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(user_id="u1")
     monkeypatch.setattr(runtime.repository, "get_conversation", fake_get)
     monkeypatch.setattr(runtime, "get_graph", lambda: FakeGraph())
     out = await runtime.resume_turn(5, "1001")

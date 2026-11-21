@@ -30,6 +30,13 @@ def owns_order(user_id: str, order_id: str) -> bool:
     return any(o["order_id"] == order_id for o in list_user_orders(user_id))
 
 
+def owns_tracking_number(user_id: str, tracking_no: str) -> bool:
+    return bool(user_id and tracking_no and any(
+        order_snapshot(order["order_id"])["tracking_no"] == tracking_no
+        for order in list_user_orders(user_id)
+    ))
+
+
 # 课程演示单。文档、curl 例子、各章验收脚本里到处写着 1001 和 2002,让每个账号名下都有
 # 这两笔,例子拿来即跑。想看归属校验拦人,随便报一个别的号(如 9999)就会被挡下。
 DEMO_ORDER_IDS = ("1001", "2002")

@@ -17,6 +17,14 @@ def test_factory_streaming_flag():
     assert get_chat_model(streaming=True).streaming is True
 
 
+def test_tool_transport_override_disables_callback_induced_streaming(monkeypatch):
+    from app.core.llm import needs_non_streaming_tools
+
+    monkeypatch.setenv("MEWHELP_TOOL_STREAMING", "off")
+    assert needs_non_streaming_tools()
+    assert get_chat_model(streaming=False).disable_streaming is True
+
+
 def test_思考链三项留空就一个都不传(monkeypatch):
     # 留空 = 用上游默认,不能替调用方塞参数
     for k in ("chat_thinking", "chat_reasoning_effort", "chat_reasoning_split"):

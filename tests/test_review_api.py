@@ -3,6 +3,8 @@
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
 """ch09 审核 API:列表/详情/通过(写回知识库)/驳回;只有待审可流转;写回失败状态不动。"""
+import asyncio
+
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -27,18 +29,11 @@ async def client(app, db_session_factory):
 
 @pytest.fixture
 def stub_kb(monkeypatch):
-    written = {}
+    async def vectorize(*, chunk_ids):
+        for chunk_id in chunk_ids:
+            await repository.mark_chunk_vectorized(chunk_id, str(chunk_id))
 
-    async def fake_write(chunks):
-        written["chunks"] = chunks
-        return [101]
-
-    async def fake_vectorize():
-        written["vectorized"] = True
-        return 1
-    monkeypatch.setattr(review_api, "_write_chunks", fake_write)
-    monkeypatch.setattr(review_api, "_vectorize", fake_vectorize)
-    return written
+    monkeypatch.setattr(review_api.dualwrite, "vectorize_pending", vectorize)
 
 
 async def _seed():
@@ -69,51 +64,36 @@ async def test_detail_carries_raws_and_snapshot(client):
     assert (await client.get("/api/review/99999")).status_code == 404
 
 
-async def test_approve_writes_kb_and_flips_status(client, stub_kb):
+async def test_concurrent_approve_writes_once(client, stub_kb):
     rid = await _seed()
-    r = await client.post(f"/api/review/{rid}/approve", json={"approved_answer": "可以水洗,注意阴干"})
-    assert r.status_code == 200 and r.json()["chunk_ids"] == [101]
-    chunk = stub_kb["chunks"][0]
-    assert chunk.questions == "猫窝是否支持水洗" and chunk.answer == "可以水洗,注意阴干"
-    assert chunk.content_type == "faq"
-    assert stub_kb["vectorized"] is True
-    r2 = await client.get(f"/api/review/{rid}")
-    assert r2.json()["review_status"] == "通过"
-    # 终审后再操作 → 409
+    url = f"/api/review/{rid}/approve"
+    data = {"approved_answer": "可以水洗,注意阴干"}
+    a, b = await asyncio.gather(client.post(url, json=data), client.post(url, json=data))
+    assert a.status_code == b.status_code == 200
+    assert a.json()["chunk_ids"] == b.json()["chunk_ids"]
+    assert await repository.list_chunk_pairs() == [("猫窝是否支持水洗", data["approved_answer"])]
+    assert (await client.get(f"/api/review/{rid}")).json()["review_status"] == "通过"
     assert (await client.post(f"/api/review/{rid}/reject")).status_code == 409
 
 
-async def test_approve_failure_keeps_pending(client, monkeypatch):
+async def test_approve_retries_existing_publication(client, monkeypatch, stub_kb):
     rid = await _seed()
+    url = f"/api/review/{rid}/approve"
+    data = {"approved_answer": "可以水洗"}
+    vectorize = review_api.dualwrite.vectorize_pending
 
-    async def boom(chunks):
-        raise RuntimeError("上游不在线")
-    monkeypatch.setattr(review_api, "_write_chunks", boom)
-    r = await client.post(f"/api/review/{rid}/approve", json={"approved_answer": "x"})
-    assert r.status_code == 502
-    assert (await client.get(f"/api/review/{rid}")).json()["review_status"] == "待审"   # 可重试
-
-
-async def test_approve_vectorize_failure_rolls_back_pending_chunks(client, monkeypatch):
-    """写库成功但向量化失败:必须删掉本次 pending chunk,否则重试会造出重复知识条目。"""
-    rid = await _seed()
-    deleted = {}
-
-    async def fake_write(chunks):
-        return [321]
-
-    async def boom_vectorize():
+    async def fail_vectorize(*, chunk_ids):
         raise RuntimeError("Milvus 不在线")
 
-    async def spy_delete(ids):
-        deleted["ids"] = ids
-    monkeypatch.setattr(review_api, "_write_chunks", fake_write)
-    monkeypatch.setattr(review_api, "_vectorize", boom_vectorize)
-    monkeypatch.setattr(review_api.repository, "delete_knowledge_chunks", spy_delete)
-    r = await client.post(f"/api/review/{rid}/approve", json={"approved_answer": "x"})
-    assert r.status_code == 502
-    assert deleted["ids"] == [321]                                                     # 已回滚
-    assert (await client.get(f"/api/review/{rid}")).json()["review_status"] == "待审"
+    monkeypatch.setattr(review_api.dualwrite, "vectorize_pending", fail_vectorize)
+    assert (await client.post(url, json=data)).status_code == 502
+    assert (await client.get(f"/api/review/{rid}")).json()["publishing"] is True
+    assert (await client.post(f"/api/review/{rid}/reject")).status_code == 409
+    assert (await client.post(url, json={"approved_answer": "不同答案"})).status_code == 409
+    monkeypatch.setattr(review_api.dualwrite, "vectorize_pending", vectorize)
+
+    assert (await client.post(url, json=data)).status_code == 200
+    assert await repository.list_chunk_pairs() == [("猫窝是否支持水洗", data["approved_answer"])]
 
 
 async def test_reject_flips_status(client):

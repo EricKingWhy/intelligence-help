@@ -282,15 +282,17 @@
         main.appendChild(occ);
         main.appendChild(el("div", "qtext", it.normalized_question));
         main.appendChild(el("div", "ans-preview", it.ai_suggested_answer || "(无示例答案)"));
-        main.appendChild(el("span", "badge st-" + it.review_status, it.review_status));
+        main.appendChild(el("span", "badge st-" + it.review_status,
+          it.publishing ? "写回未完成" : it.review_status));
         const ops = el("div", "ops");
         if (it.review_status === "待审") {
-          const ok = el("button", "btn ok", "通过");
+          const ok = el("button", "btn ok", it.publishing ? "继续写回" : "通过");
           ok.addEventListener("click", (e) => {
             e.stopPropagation();
             approving = it.id;
             modalQ.textContent = "标准化问题:" + it.normalized_question;
-            modalAnswer.value = it.ai_suggested_answer || "";
+            modalAnswer.value = it.publication_answer || it.ai_suggested_answer || "";
+            modalAnswer.readOnly = it.publishing;
             mask.classList.add("open");
             modalAnswer.focus();
           });
@@ -304,7 +306,8 @@
               load();
             } catch (err) { toast("驳回失败:" + err.message, true); no.disabled = false; }
           });
-          ops.appendChild(ok); ops.appendChild(no);
+          ops.appendChild(ok);
+          if (!it.publishing) ops.appendChild(no);
         }
         main.appendChild(ops);
         main.addEventListener("click", () => toggleDetail(card, it.id));

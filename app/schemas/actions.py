@@ -33,3 +33,4 @@ class ResumeRequest(BaseModel):
     conversation_id: int
     order_id: str | None = Field(default=None, min_length=1)   # ch06 订单选择器点选
     confirmed: bool | None = None                              # ch08 工单预览 确认/取消
+    confirmation_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")

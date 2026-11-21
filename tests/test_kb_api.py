@@ -171,21 +171,26 @@ async def test_挖出来的条目要人点采纳才进知识库(client, monkeypa
     await repository.set_staging_status([sid], "kept")
     assert (await repository.knowledge_stats())["total"] == 0    # 待审阶段库里一条没有
 
-    monkeypatch.setattr(kb_api.dualwrite, "vectorize_pending", lambda: _noop())
+    monkeypatch.setattr(kb_api.dualwrite, "vectorize_pending", _simulate_publication)
     resp = await client.post("/api/kb/staging/approve", json={"ids": [sid]})
     assert resp.status_code == 200 and resp.json()["approved"] == 1
     assert (await repository.knowledge_stats())["total"] == 1    # 采纳之后才落库
 
 
-async def test_同一条重复采纳会被挡掉(client, monkeypatch):
+async def _simulate_publication(*, chunk_ids):
+    for chunk_id in chunk_ids:
+        await repository.mark_chunk_vectorized(chunk_id, str(chunk_id))
+
+
+async def test_同一条重复采纳复用知识块(client, monkeypatch):
     """页面上手快点两下、或者拿已弃用的行来入库,都不该造出重复知识。"""
-    monkeypatch.setattr(kb_api.dualwrite, "vectorize_pending", lambda: _noop())
+    monkeypatch.setattr(kb_api.dualwrite, "vectorize_pending", _simulate_publication)
     sid = await repository.insert_staging("mine-t", "conv:1", "运费怎么算", "满99包邮")
     await repository.set_staging_status([sid], "kept")
 
     assert (await client.post("/api/kb/staging/approve", json={"ids": [sid]})).status_code == 200
     again = await client.post("/api/kb/staging/approve", json={"ids": [sid]})
-    assert again.status_code == 409                               # 已经不是待审了
+    assert again.status_code == 200
     assert (await repository.knowledge_stats())["total"] == 1     # 库里仍是一条
 
 

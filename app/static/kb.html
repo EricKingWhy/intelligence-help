@@ -372,8 +372,8 @@
             tr.appendChild(td);
             if (st === "kept") {
               const act = el("td");
-              act.appendChild(mkReviewBtn("采纳", "approve", r.id));
-              act.appendChild(mkReviewBtn("弃用", "reject", r.id));
+              act.appendChild(mkReviewBtn(r.publishing ? "继续写回" : "采纳", "approve", r.id));
+              if (!r.publishing) act.appendChild(mkReviewBtn("弃用", "reject", r.id));
               tr.appendChild(act);
             }
             tbl.appendChild(tr);

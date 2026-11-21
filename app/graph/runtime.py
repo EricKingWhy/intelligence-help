@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # 会流式吐答复 token 的节点(其余节点的模型调用 token 不进 delta)
 ANSWER_NODES = {"main_agent"}
 # 确定性节点把答复写在 state['answer'],整块作为 delta 吐出
-DETERMINISTIC_ANSWER_NODES = {"script_reply", "complaint_reply", "fallback_reply"}
+DETERMINISTIC_ANSWER_NODES = {"script_reply", "complaint_reply", "fallback_reply", "handoff_reply"}
 # 产出编号引用的检索节点(知识路 retrieve_knowledge + 退款政策路 retrieve_policy)
 CITATION_NODES = {"retrieve_knowledge", "retrieve_policy"}
 

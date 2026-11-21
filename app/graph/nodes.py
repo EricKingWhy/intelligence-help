@@ -15,7 +15,7 @@ from app.core import intent as intent_mod
 from app.core import memory
 from app.core import query_understanding, retrieval, selfcheck
 from app.core.confidence import compute_evidence_confidence, snapshot_from_hits
-from app.core.llm import get_chat_model
+from app.core.llm import force_non_streaming_tools, get_chat_model
 from app.core.observability import tag_intent
 from app.core.prompts import (
     AGENT_SYSTEM, COMPLAINT_REPLY_TEXT, FALLBACK_REPLY_TEXT,
@@ -58,6 +58,7 @@ def _history_text(state, max_turns: int = 6) -> str:
 
 # 4+ 位连续数字视作订单号;用 lookaround 而非 \b——CJK 与数字同属 \w,\b 在「订单1001」处不成立
 _ORDER_RE = re.compile(r"(?<!\d)(\d{4,})(?!\d)")
+_DIRECT_HANDOFF = re.compile(r"(?:我[要想]|请(?:帮我)?|帮我)?(?:转(?:接)?|找|联系)人工(?:客服)?[。！？!?]*")
 
 
 def _extract_order_id(text: str) -> str | None:
@@ -118,10 +119,23 @@ async def script_reply(state) -> dict:
     return {"answer": text, "trace": {"route": "fallback_script"}}
 
 
+def transfer_action(state) -> dict:
+    message_id = next((m.id for m in reversed(state.get("messages", []))
+                       if isinstance(m, HumanMessage)), None)
+    if message_id and message_id.startswith("db-") and message_id[3:].isdigit():
+        return {"type": "transfer_human", "message_id": int(message_id[3:])}
+    return {"type": "transfer_human"}
+
+
+async def handoff_reply(state) -> dict:
+    return {"answer": "可以。请确认是否将本轮问题转给人工客服。",
+            "suggested_actions": [transfer_action(state)]}
+
+
 async def complaint_reply(state) -> dict:
     """投诉:安抚话术 + 转人工/建工单两个可选项(后端不执行,交前端自选)。"""
     actions = [
-        {"type": "transfer_human"},
+        transfer_action(state),
         {"type": "create_ticket",
          "draft": {"description": _user_text(state), "ticket_type": "投诉"}},
     ]
@@ -148,7 +162,7 @@ async def fallback_reply(state) -> dict:
         retrieved_chunks=snapshot,
     )
     return {"answer": FALLBACK_REPLY,
-            "suggested_actions": [{"type": "transfer_human"}],
+            "suggested_actions": [transfer_action(state)],
             "trace": {"route": "fallback"}}
 
 
@@ -156,6 +170,8 @@ async def resolve_reference(state) -> dict:
     """指代消解 + Query 改写(合一):吃最近几轮历史把半截话补成完整问句;已完整则透传。
     写 resolved_query,供 classify_intent 与 refund_flow 检索共用(意图识别不再改写)。"""
     query = _user_text(state)
+    if _DIRECT_HANDOFF.fullmatch(query.strip()):
+        return {"resolved_query": query, "trace": {"coref": "passthrough"}}
     history = _history_text(state)
     # ch07 验收可观测:每轮必经此节点,摘要行+滑窗在这一条日志里直接可见
     # (model_ctx 只在进 main_agent 的路由才有,闲聊/兜底路由靠这条看)
@@ -171,6 +187,10 @@ async def classify_intent(state) -> dict:
     判当前意图(应对物流→退款→物流漂移)。把归属出口 route 落进 State(供 _agent_messages 判注入、
     log 留痕;route_by_intent 条件边按同一 INTENT_TO_ROUTE 分流,单一来源不漂移)。"""
     query = state.get("resolved_query") or _user_text(state)
+    if _DIRECT_HANDOFF.fullmatch(_user_text(state).strip()):
+        tag_intent("人工", 1.0)
+        return {"intent": "人工", "intent_confidence": 1.0, "route": "handoff",
+                "trace": {"intent": "人工", "intent_confidence": 1.0, "route": "handoff"}}
     r = await intent_mod.classify(query, _history_text(state))
     intent, conf = r["intent"], r["confidence"]
     route = INTENT_TO_ROUTE.get(intent, "business")
@@ -184,8 +204,8 @@ async def retrieve_knowledge(state) -> dict:
     ch09 把 ch05 最简机械闸升级成正式置信度闸(四信号加权,阈值评估集校准),
     闸位不动:检索后、进 Agent 前。快照规则:只要走了检索就存 Top3 快照——
     闸不过随落池写库;闸都过留在 state 供事后 👎 回捞(踩的往往是「检到了但答砸」)。"""
-    query_raw = _user_text(state)
-    u = await query_understanding.understand(query_raw)
+    query = (state.get("resolved_query") or "").strip() or _user_text(state)
+    u = await query_understanding.understand(query)
     query = u["standard"]
     bm25_text = query + (" " + " ".join(u["expanded"]) if u["expanded"] else "")
 
@@ -317,7 +337,9 @@ async def main_agent(state, config=None) -> dict:
     注:streaming=True 下 ChatOpenAI 默认不回传 usage_metadata;usage 回传已在
     get_chat_model 统一收口(ch09 stream_usage=True),这里不再单独 bind。"""
     specs = await registry.get_all_specs()   # ch08 现问现拿:内置+MCP 合并清单,每轮现拉
-    model = get_chat_model(streaming=True).bind_tools([s.tool for s in specs])
+    model = get_chat_model(streaming=not force_non_streaming_tools()).bind_tools(
+        [s.tool for s in specs],
+    )
     msgs = _agent_messages(state)
     _log_model_context(state, msgs)   # ch07:摘要+滑窗进日志,验收 tail -f 可见
     ai: AIMessage = await model.ainvoke(msgs, config)
@@ -348,18 +370,35 @@ async def agent_tools(state) -> dict:
     ticket_calls = [tc for tc in last.tool_calls if tc["name"] == "create_ticket"]
     tspec = specs.get("create_ticket")
     decision = None
+    confirmation_id = ""
     if ticket_calls and tspec is not None \
             and engine.validate_args(tspec, dict(ticket_calls[0].get("args") or {})) is None:
         first_args = ticket_calls[0]["args"]
+        confirmation_id = engine.ticket_confirmation_id(last.id or "", ticket_calls[0]["id"])
         decision = interrupt({"type": "confirm_ticket",
                               "preview": {"ticket_type": first_args.get("ticket_type", "咨询"),
-                                          "description": first_args.get("description", "")}})
+                                          "description": first_args.get("description", ""),
+                                          "confirmation_id": confirmation_id}})
 
     tool_msgs = []
     actions = list(state.get("suggested_actions", []))
     not_owned = False        # 这一轮有没有人报了不属于自己的订单号
     for tc in last.tool_calls:
-        if tc["name"] == "submit_refund":
+        name = tc["name"]
+        args = tc.get("args") or {}
+        spec = specs.get(name)
+        if spec is not None and spec.source == "mcp" and (
+            (name in {"query_warranty", "query_return_status"} and "order_id" in args
+             and not business.owns_order(uid, str(args["order_id"])))
+            or (name == "query_logistics" and "tracking_no" in args
+                and not business.owns_tracking_number(uid, str(args["tracking_no"])))
+        ):
+            not_owned = True
+            tool_msgs.append(ToolMessage(
+                content="没有找到这位用户的订单或运单，请引导用户核对自己的订单。",
+                tool_call_id=tc["id"], name=name, status="error",
+            ))
+        elif name == "submit_refund":
             # submit_refund 在这里就被拦成前端表单、不进执行引擎,所以工具内那道归属校验
             # 对它不生效,得在拦截之前判一次。不然退款入口就成了绕过校验的后门。
             if not business.owns_order(uid, str(tc["args"].get("order_id") or "")):
@@ -379,8 +418,10 @@ async def agent_tools(state) -> dict:
             if tc is ticket_calls[0]:
                 # resume 值形状守卫:同一 resume 端点服务两种中断,错配(如传了 order_id 字符串)
                 # 一律按未确认处理——宁可让用户重来,不让节点炸
-                if isinstance(decision, dict) and decision.get("confirmed"):
-                    run = await engine.execute_tool_call(tc, cid, specs, confirmed=True,
+                if (isinstance(decision, dict) and decision.get("confirmed")
+                        and decision.get("confirmation_id", confirmation_id) == confirmation_id):
+                    scoped_call = {**tc, "submission_scope": last.id or ""}
+                    run = await engine.execute_tool_call(scoped_call, cid, specs, confirmed=True,
                                                         user_id=uid)
                 else:
                     run = await engine.execute_tool_call(
@@ -429,6 +470,31 @@ async def log_node(state) -> dict:
     )
     answer = resolve_answer(state)
     if state.get("conversation_id"):
-        await repository.append_message(state["conversation_id"], "assistant",
-                                        content=answer or None)
+        offer = next((action for action in state.get("suggested_actions", [])
+                      if action.get("type") == "transfer_human" and action.get("message_id")), None)
+        evidence = state.get("retrieved_snapshot") or []
+        message_id = transfer_action(state).get("message_id")
+        if message_id and (offer or evidence):
+            user_id = state.get("user_id", "")
+            question = _user_text(state)
+            if state.get("route") == "handoff":
+                recent = await repository.list_dialog_messages(state["conversation_id"])
+                for previous in reversed(recent):
+                    if previous.role == "user" and previous.id < message_id and previous.content:
+                        if _DIRECT_HANDOFF.fullmatch(previous.content.strip()):
+                            continue
+                        question = previous.content
+                        evidence = (previous.handoff_context or {}).get("evidence", [])
+                        break
+            order_id = state.get("order_id") or _extract_order_id(question)
+            order = None
+            if order_id and business.owns_order(user_id, order_id):
+                order = next(row for row in business.list_user_orders(user_id)
+                             if row["order_id"] == order_id)
+            context = {"offered": bool(offer), "question": question[:4000],
+                       "order": order, "evidence": evidence}
+            await repository.append_message(state["conversation_id"], "assistant",
+                                            content=answer or None, handoff=(message_id, context))
+        else:
+            await repository.append_message(state["conversation_id"], "assistant", content=answer or None)
     return {}

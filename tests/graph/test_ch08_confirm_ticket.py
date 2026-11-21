@@ -56,7 +56,8 @@ def wired(monkeypatch):
 
     created, audits = [], []
 
-    async def fake_create(cid, desc, ttype):
+    async def fake_create(cid, desc, ttype, *, submission_key):
+        assert submission_key.startswith("agent:")
         created.append((cid, desc, ttype))
         return "T20260717001"
 
@@ -81,7 +82,9 @@ async def test_confirm_true_creates_ticket(wired):
     st = await g.ainvoke(_graph_input("u1", "帮我建个工单,猫砂盆漏电", 1, 1, "", 0), cfg)
     intr = st["__interrupt__"][0].value
     assert intr["type"] == "confirm_ticket"
-    assert intr["preview"] == {"ticket_type": "售后", "description": "猫砂盆漏电"}
+    assert intr["preview"]["ticket_type"] == "售后"
+    assert intr["preview"]["description"] == "猫砂盆漏电"
+    assert len(intr["preview"]["confirmation_id"]) == 64
     assert created == []                                        # interrupt 时未执行
 
     st2 = await g.ainvoke(Command(resume={"confirmed": True}), cfg)

@@ -3,6 +3,7 @@
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
 from datetime import datetime
+from uuid import uuid4
 
 from sqlalchemy import case, func, select, update
 
@@ -21,13 +22,12 @@ from app.db.models import (
     TopicClassification,
 )
 
-_TICKET_SEQ = 0
-
-
 def _gen_ticket_no() -> str:
-    global _TICKET_SEQ
-    _TICKET_SEQ += 1
-    return f"T{datetime.now():%Y%m%d%H%M%S}{_TICKET_SEQ:03d}"
+    return f"T{datetime.now():%Y%m%d%H%M%S}{uuid4().hex[:17]}"
+
+
+class SubmissionConflict(Exception):
+    pass
 
 
 async def create_conversation(user_id: str) -> int:
@@ -49,6 +49,7 @@ async def append_message(
     content: str | None = None,
     tool_calls: list | None = None,
     tool_call_id: str | None = None,
+    *, handoff: tuple[int, dict] | None = None,
 ) -> int:
     async with db.async_session() as s:
         msg = Message(
@@ -59,6 +60,12 @@ async def append_message(
             tool_call_id=tool_call_id,
         )
         s.add(msg)
+        if handoff is not None:
+            message_id, context = handoff
+            await s.execute(update(Message).where(
+                Message.id == message_id, Message.conversation_id == conversation_id,
+                Message.role == "user", Message.handoff_context.is_(None),
+            ).values(handoff_context=context))
         await s.commit()
         return msg.id
 
@@ -73,22 +80,94 @@ async def list_messages(conversation_id: int) -> list[Message]:
         return list(result.scalars())
 
 
-async def create_ticket(conversation_id: int, description: str, ticket_type: str) -> str:
+async def create_ticket(
+    conversation_id: int, description: str, ticket_type: str, *, submission_key: str | None = None,
+    handoff_context: dict | None = None,
+) -> str:
     ticket_no = _gen_ticket_no()
     async with db.async_session() as s:
+        # The conversation lock serializes submissions across application processes.
+        conv = await s.get(Conversation, conversation_id, with_for_update=True)
+        if submission_key is not None:
+            previous = await s.scalar(select(Ticket).where(
+                Ticket.conversation_id == conversation_id, Ticket.submission_key == submission_key,
+            ))
+            if previous is not None:
+                if (previous.description, previous.ticket_type) != (description, ticket_type):
+                    raise SubmissionConflict
+                return previous.ticket_no
         s.add(
             Ticket(
                 ticket_no=ticket_no,
                 conversation_id=conversation_id,
                 description=description,
                 ticket_type=ticket_type,
+                submission_key=submission_key,
+                handoff_context=handoff_context,
             )
         )
-        conv = await s.get(Conversation, conversation_id)
         if conv is not None:
             conv.status = "已转人工"
         await s.commit()
     return ticket_no
+
+
+async def get_ticket_result(conversation_id: int, submission_key: str) -> str | None:
+    async with db.async_session() as s:
+        return await s.scalar(select(Ticket.ticket_no).where(
+            Ticket.conversation_id == conversation_id, Ticket.submission_key == submission_key,
+        ))
+
+
+async def get_handoff_message(conversation_id: int, message_id: int) -> Message | None:
+    async with db.async_session() as s:
+        message = await s.scalar(select(Message).where(
+            Message.id == message_id, Message.conversation_id == conversation_id,
+            Message.role == "user", Message.handoff_context.is_not(None),
+        ))
+        return message if message and message.handoff_context.get("offered") else None
+
+
+async def get_handoff_ticket(ticket_no: str) -> Ticket | None:
+    async with db.async_session() as s:
+        return await s.scalar(select(Ticket).where(
+            Ticket.ticket_no == ticket_no, Ticket.handoff_context.is_not(None),
+        ))
+
+
+async def list_handoffs(*, conversation_id: int | None = None, status: str | None = None,
+                        limit: int = 50, offset: int = 0) -> list[Ticket]:
+    query = select(Ticket).where(Ticket.handoff_context.is_not(None))
+    if conversation_id is not None:
+        query = query.where(Ticket.conversation_id == conversation_id)
+    if status is not None:
+        query = query.where(Ticket.status == ("待处理" if status == "open" else "已处理"))
+    direction = Ticket.created_at.asc() if status == "open" else Ticket.created_at.desc()
+    async with db.async_session() as s:
+        return list((await s.scalars(query.order_by(
+            direction, Ticket.ticket_no,
+        ).limit(limit).offset(offset))).all())
+
+
+async def update_handoff(ticket_no: str, operator: str, resolution: str | None) -> Ticket:
+    async with db.async_session() as s, s.begin():
+        ticket = await s.get(Ticket, ticket_no, with_for_update=True)
+        if ticket is None or ticket.handoff_context is None:
+            raise LookupError(ticket_no)
+        if ticket.status == "已处理":
+            if ticket.assigned_to == operator and resolution is not None and ticket.resolution == resolution:
+                return ticket
+            raise SubmissionConflict
+        if ticket.assigned_to not in (None, operator):
+            raise SubmissionConflict
+        if resolution is None:
+            ticket.assigned_to = operator
+        elif ticket.assigned_to == operator:
+            ticket.status = "已处理"
+            ticket.resolution = resolution
+        else:
+            raise SubmissionConflict
+        return ticket
 
 
 # ---- ch07 会话上下文管理(滑窗 + 异步摘要)----
@@ -127,6 +206,8 @@ async def list_conversations(user_id: str, limit: int = 50) -> list[dict]:
         )).scalars())
         out = []
         for c in convs:
+            if c.user_id != user_id:
+                continue
             first = (await s.execute(
                 select(Message.content)
                 .where(Message.conversation_id == c.id, Message.role == "user")
@@ -170,13 +251,12 @@ async def insert_knowledge_chunk(
         return row.id
 
 
-async def list_pending_chunks() -> list[KnowledgeChunk]:
+async def list_pending_chunks(chunk_ids: list[int] | None = None) -> list[KnowledgeChunk]:
+    query = select(KnowledgeChunk).where(KnowledgeChunk.vectorize_status == "pending")
+    if chunk_ids is not None:
+        query = query.where(KnowledgeChunk.id.in_(chunk_ids))
     async with db.async_session() as s:
-        result = await s.execute(
-            select(KnowledgeChunk)
-            .where(KnowledgeChunk.vectorize_status == "pending")
-            .order_by(KnowledgeChunk.id)
-        )
+        result = await s.execute(query.order_by(KnowledgeChunk.id))
         return list(result.scalars())
 
 
@@ -457,14 +537,63 @@ async def get_review_detail(review_id: int) -> tuple[ReviewQueue, list[LowConfid
 async def update_review_status(review_id: int, status: str, approved_answer: str | None = None) -> bool:
     """仅「待审」可流转(通过/驳回都是终态);返回是否真的更新了。"""
     async with db.async_session() as s:
-        row = await s.get(ReviewQueue, review_id)
-        if row is None or row.review_status != "待审":
+        row = await s.get(ReviewQueue, review_id, with_for_update=True)
+        if row is None or row.review_status != "待审" or row.publication_chunk_id is not None:
             return False
         row.review_status = status
         if approved_answer is not None:
             row.approved_answer = approved_answer
         await s.commit()
         return True
+
+
+async def prepare_publication(model, row_id: int, make_chunk, *, answer: str | None = None) -> int:
+    review = model is ReviewQueue
+    async with db.async_session() as s, s.begin():
+        row = await s.get(model, row_id, with_for_update=True)
+        if row is None:
+            raise LookupError(row_id)
+        status = row.review_status if review else row.status
+        pending, approved = ("待审", "通过") if review else ("kept", "approved")
+        if status not in {pending, approved}:
+            raise SubmissionConflict
+        if row.publication_chunk_id is not None:
+            if review and row.approved_answer != answer:
+                raise SubmissionConflict
+            if await s.get(KnowledgeChunk, row.publication_chunk_id) is not None:
+                return row.publication_chunk_id
+        if status != pending:
+            raise SubmissionConflict
+        chunk = make_chunk(row)
+        s.add(chunk)
+        await s.flush()
+        row.publication_chunk_id = chunk.id
+        if review:
+            row.approved_answer = answer
+        return chunk.id
+
+
+async def finish_publication(model, row_id: int, chunk_id: int) -> None:
+    async with db.async_session() as s, s.begin():
+        row = await s.get(model, row_id, with_for_update=True)
+        chunk = await s.get(KnowledgeChunk, chunk_id)
+        if row is None or row.publication_chunk_id != chunk_id or (
+            chunk is None or chunk.vectorize_status != "done"
+        ):
+            raise RuntimeError("审核关联的知识块尚未同步")
+        if model is ReviewQueue:
+            row.review_status = "通过"
+        else:
+            row.status = "approved"
+
+
+async def reject_staging(ids: list[int]) -> int:
+    async with db.async_session() as s, s.begin():
+        result = await s.execute(update(QaExtractionStaging).where(
+            QaExtractionStaging.id.in_(ids), QaExtractionStaging.status == "kept",
+            QaExtractionStaging.publication_chunk_id.is_(None),
+        ).values(status="rejected"))
+        return result.rowcount
 
 
 async def delete_knowledge_chunks(ids: list[int]) -> None:
