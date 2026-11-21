@@ -31,6 +31,7 @@ def _builder() -> StateGraph:
     b.add_edge("resolve_reference", "classify_intent")
     b.add_conditional_edges("classify_intent", route_by_intent, {
         "escalate": "complaint_reply",
+        "service_failure": "fallback_reply",
         "handoff": "handoff_reply",
         "fallback_script": "script_reply",
         "knowledge": "retrieve_knowledge",
@@ -39,7 +40,9 @@ def _builder() -> StateGraph:
     })
     # 退款子流程确定性链:取单 → 检索政策 → 交主力 Agent 判能不能退
     b.add_edge("fetch_order", "retrieve_policy")
-    b.add_edge("retrieve_policy", "main_agent")
+    b.add_conditional_edges("retrieve_policy",
+                            lambda state: "fallback_reply" if state.get("service_failure") else "main_agent",
+                            ["fallback_reply", "main_agent"])
     # 知识路:检索 → 生成前证据闸
     b.add_edge("retrieve_knowledge", "confidence_check")
     b.add_conditional_edges("confidence_check", confidence_gate, {
@@ -49,6 +52,7 @@ def _builder() -> StateGraph:
     # 主力 Agent ReAct 环
     b.add_conditional_edges("main_agent", should_continue, {
         "continue": "agent_tools",
+        "service_failure": "fallback_reply",
         "stop": "log",
     })
     b.add_edge("agent_tools", "main_agent")

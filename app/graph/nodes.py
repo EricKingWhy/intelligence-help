@@ -21,6 +21,7 @@ from app.core.prompts import (
     AGENT_SYSTEM, COMPLAINT_REPLY_TEXT, FALLBACK_REPLY_TEXT,
     REFUND_JUDGE_HINT, SCRIPT_REPLY_CHITCHAT, SCRIPT_REPLY_OTHER,
 )
+from app.core.upstream import UPSTREAM_ERRORS, failure
 from app.db import repository
 from app.graph.routing import INTENT_TO_ROUTE
 from app.tools import business, engine, registry
@@ -94,11 +95,14 @@ async def retrieve_policy(state) -> dict:
     queries = await query_understanding.expand_queries(seed)
 
     merged: dict = {}                       # chunk id -> 最高分 hit
-    for q in queries:
-        for h in await retrieval.search_knowledge(q, strategy="hybrid_rerank", bm25_text=q):
-            cur = merged.get(h["id"])
-            if cur is None or h["rerank_score"] > cur["rerank_score"]:
-                merged[h["id"]] = h
+    try:
+        for q in queries:
+            for h in await retrieval.search_knowledge(q, strategy="hybrid_rerank", bm25_text=q):
+                cur = merged.get(h["id"])
+                if cur is None or h["rerank_score"] > cur["rerank_score"]:
+                    merged[h["id"]] = h
+    except UPSTREAM_ERRORS as exc:
+        return {"service_failure": failure(exc, "refund_retrieval")}
     ranked = sorted(merged.values(), key=lambda h: h["rerank_score"], reverse=True)
     arranged = retrieval.arrange_head_tail(ranked)
     citations = [
@@ -147,6 +151,29 @@ async def fallback_reply(state) -> dict:
     """置信度兜底:证据弱回兜底话术,并把问题落低置信池留给数据飞轮
     (ch09:source 打对标签 retrieval_low_conf/self_check,随条存召回快照给审核页)。
     话术让用户「联系人工客服」,转人工按钮就得一并递给前端(actions 帧),不能光嘴上说。"""
+    if service_failure := state.get("service_failure"):
+        kind = service_failure["kind"]
+        answers = {
+            "rate_limited": "客服系统现在比较繁忙，您可以稍后重试或转人工。",
+            "timeout": "这次查询等待超时，您可以稍后重试或转人工。",
+            "knowledge_unavailable": "知识库暂时无法查询，您可以稍后重试或转人工。",
+            "unavailable": "客服服务暂时不可用，您可以稍后重试或转人工。",
+        }
+        actions = [transfer_action(state)]
+        write_attempted = False
+        for message in reversed(state.get("messages", [])):
+            if isinstance(message, HumanMessage):
+                break
+            if isinstance(message, ToolMessage) and message.name == "create_ticket":
+                write_attempted = True
+                break
+        if write_attempted:
+            answer = "工单操作后，客服回复暂时不可用。您可以确认原工单状态或转人工。"
+        else:
+            answer = answers[kind]
+            actions.insert(0, {"type": "retry_turn", "draft": {"message": _user_text(state)}})
+        return {"answer": answer, "suggested_actions": actions,
+                "trace": {"route": "service_failure", "service_failure": service_failure}}
     source = state.get("fallback_source") or "retrieval_low_conf"
     signals = state.get("trace", {}).get("confidence_signals") or {}
     reason = (f"evidence_confidence={state.get('evidence_confidence', 0.0):.3f} "
@@ -192,6 +219,9 @@ async def classify_intent(state) -> dict:
         return {"intent": "人工", "intent_confidence": 1.0, "route": "handoff",
                 "trace": {"intent": "人工", "intent_confidence": 1.0, "route": "handoff"}}
     r = await intent_mod.classify(query, _history_text(state))
+    if r.get("service_failure"):
+        return {"intent": "其他", "route": "service_failure",
+                "service_failure": r["service_failure"]}
     intent, conf = r["intent"], r["confidence"]
     route = INTENT_TO_ROUTE.get(intent, "business")
     tag_intent(intent, conf)   # ch09:意图进当前 trace 的 metadata+tag,Cost Control 按意图分堆
@@ -209,8 +239,11 @@ async def retrieve_knowledge(state) -> dict:
     query = u["standard"]
     bm25_text = query + (" " + " ".join(u["expanded"]) if u["expanded"] else "")
 
-    hits = await retrieval.search_knowledge(
-        query, strategy="hybrid_rerank", bm25_text=bm25_text)
+    try:
+        hits = await retrieval.search_knowledge(
+            query, strategy="hybrid_rerank", bm25_text=bm25_text)
+    except UPSTREAM_ERRORS as exc:
+        return {"service_failure": failure(exc, "knowledge_retrieval"), "evidence_strong": False}
     conf = compute_evidence_confidence(hits)
     base = {"evidence_confidence": conf.score,
             "retrieved_snapshot": snapshot_from_hits(hits)}
@@ -224,6 +257,8 @@ async def retrieve_knowledge(state) -> dict:
     # 语义闸:生成前自评证据够不够(README 的 useful 判断;ch09 修正:这才是 self_check 入口)
     ev_texts = [f"{h['question']} {h['answer']}" for h in hits]
     chk = await selfcheck.check_sufficient(query, ev_texts)
+    if chk.get("service_failure"):
+        return {**base, "service_failure": chk["service_failure"], "evidence_strong": False}
     if not chk["useful"]:
         return {**base, "evidence_strong": False, "fallback_source": "self_check",
                 "trace": {"forced_rag": True, "evidence_confidence": conf.score,
@@ -342,7 +377,10 @@ async def main_agent(state, config=None) -> dict:
     )
     msgs = _agent_messages(state)
     _log_model_context(state, msgs)   # ch07:摘要+滑窗进日志,验收 tail -f 可见
-    ai: AIMessage = await model.ainvoke(msgs, config)
+    try:
+        ai: AIMessage = await model.ainvoke(msgs, config)
+    except UPSTREAM_ERRORS as exc:
+        return {"service_failure": failure(exc, "generation")}
     usage = ai.usage_metadata or {}
     used = usage.get("total_tokens", 0)
     # 前缀缓存命中数:system + tools 那段稳定前缀有没有真被复用,只能靠上游报的这个数看。
@@ -493,6 +531,10 @@ async def log_node(state) -> dict:
                              if row["order_id"] == order_id)
             context = {"offered": bool(offer), "question": question[:4000],
                        "order": order, "evidence": evidence}
+            if service_failure := state.get("service_failure"):
+                context["service_failure"] = service_failure
+                context["retryable"] = any(action.get("type") == "retry_turn"
+                                           for action in state.get("suggested_actions", []))
             await repository.append_message(state["conversation_id"], "assistant",
                                             content=answer or None, handoff=(message_id, context))
         else:

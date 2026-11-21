@@ -31,8 +31,10 @@ async def submit_feedback(req: FeedbackRequest, principal: Principal) -> Feedbac
     snapshot = None
     try:
         turn = await runtime.get_turn_snapshot(req.conversation_id)
-        if turn["snapshot"] and _same_question(turn["question"], req.question):
-            snapshot = turn["snapshot"]
+        if _same_question(turn["question"], req.question):
+            if turn.get("service_failure"):
+                return FeedbackResponse(pooled=False)
+            snapshot = turn["snapshot"] or None
     except Exception:
         logger.warning("feedback 快照回捞失败 conv=%s(照常落池)", req.conversation_id, exc_info=True)
 

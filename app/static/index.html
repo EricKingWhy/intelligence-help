@@ -981,6 +981,13 @@
           if (!cid || !a.message_id) continue;
           btn.textContent = "转人工";
           btn.addEventListener("click", () => confirmHandoff(btn, cid, a.message_id));
+        } else if (a.type === "retry_turn") {
+          btn.textContent = "重试这条消息";
+          btn.addEventListener("click", () => {
+            if (cid !== getConversationId() || sendBtn.disabled) return;
+            btn.disabled = true;
+            send(a.draft.message);
+          });
         } else if (a.type === "create_ticket") {
           btn.textContent = "建工单";
           // 点「建工单」不再直接建单,而是弹出工单表单让用户选类别+填描述再提交
@@ -1255,7 +1262,7 @@
           }
           else if (data.event === "actions") on.actions && on.actions(data.items || []);
           else if (data.event === "done") setConversationId(data.conversation_id);
-          else if (data.delta !== undefined) on.delta && on.delta(data.delta);
+          else if (data.delta !== undefined) on.delta && on.delta(data.delta, data.replace);
         }
       }
     }
@@ -1266,7 +1273,7 @@
     async function streamInto(bubble, doFetch) {
       showTyping(bubble);
       let structured = false, textStarted = false, interrupted = false, raw = "";
-      let badgesEl = null, textEl = null, citations = [], actions = [];
+      let badgesEl = null, textEl = null, citations = [], actions = [], serviceFailed = false;
       function ensureStructure() {
         if (structured) return;
         bubble.innerHTML = "";
@@ -1281,8 +1288,9 @@
       }
       const resp = await doFetch();
       await readSSEStream(resp, {
-        delta: (delta) => {
+        delta: (delta, replace) => {
           ensureStructure();
+          if (replace) { raw = ""; citations = []; serviceFailed = true; }
           if (!textStarted) { textEl.innerHTML = ""; textStarted = true; }
           raw += delta;
           textEl.innerHTML = renderMarkdown(raw);
@@ -1310,7 +1318,7 @@
       if (!textStarted) { ensureStructure(); textEl.innerHTML = ""; textEl.textContent = "(无回复)"; }
       if (textStarted && citations.length) decorateCitations(textEl, citations);
       if (actions.length) renderActions(bubble, actions);
-      if (textStarted) addFeedbackBar(bubble);
+      if (textStarted && !serviceFailed) addFeedbackBar(bubble);
     }
 
     async function send(preset) {
@@ -1405,7 +1413,9 @@
               const bubble = addRow("user");
               bubble.textContent = m.content;
               if (m.handoff_message_id) {
-                renderActions(bubble, [{type: "transfer_human", message_id: m.handoff_message_id}]);
+                const historyActions = [{type: "transfer_human", message_id: m.handoff_message_id}];
+                if (m.retryable) historyActions.unshift({type: "retry_turn", draft: {message: m.content}});
+                renderActions(bubble, historyActions);
               }
             } else {
               const bubble = addRow("bot");
@@ -1414,7 +1424,7 @@
               textEl.innerHTML = renderMarkdown(m.content);
               bubble.appendChild(textEl);
               if (m.content.trim() === REPLAY_TICKET_TEXT) renderActions(bubble, [{type: "create_ticket"}]);
-              addFeedbackBar(bubble);   // 反馈条(👍/👎)回载也要有,和直播轮一致
+              if (!m.service_failed) addFeedbackBar(bubble);
             }
           }
         }

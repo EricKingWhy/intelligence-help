@@ -62,6 +62,8 @@ async def append_message(
         s.add(msg)
         if handoff is not None:
             message_id, context = handoff
+            if context.get("service_failure"):
+                msg.handoff_context = {"service_failure": context["service_failure"]}
             await s.execute(update(Message).where(
                 Message.id == message_id, Message.conversation_id == conversation_id,
                 Message.role == "user", Message.handoff_context.is_(None),
