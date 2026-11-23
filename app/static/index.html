@@ -1437,7 +1437,10 @@
           textEl.className = "bubble-text";
           textEl.innerHTML = renderMarkdown(m.content);
           bubble.appendChild(textEl);
-          if (m.content.trim() === REPLAY_TICKET_TEXT) renderActions(bubble, [{type: "create_ticket"}]);
+          // Older replies have no stored action metadata.
+          if (m.can_create_ticket ?? (m.content.trim() === REPLAY_TICKET_TEXT)) {
+            renderActions(bubble, [{type: "create_ticket"}]);
+          }
           if (!m.service_failed) addFeedbackBar(bubble, m.id, question);
         }
       }

@@ -41,6 +41,8 @@ async def list_messages(
          "created_at": m.created_at.isoformat() if m.created_at else None,
          **({"handoff_message_id": m.id} if (m.handoff_context or {}).get("offered") else {}),
          **({"retryable": True} if m.role == "user" and (m.handoff_context or {}).get("retryable") else {}),
+         **({"can_create_ticket": m.handoff_context["can_create_ticket"]} if m.role == "assistant"
+            and "can_create_ticket" in (m.handoff_context or {}) else {}),
          **({"service_failed": True} if m.role == "assistant"
             and (m.handoff_context or {}).get("service_failure") else {})}
         for m in page

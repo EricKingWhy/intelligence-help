@@ -67,3 +67,31 @@ def test_list_messages_404_when_missing(conv_client, monkeypatch):
         return None
     monkeypatch.setattr(api.repository, "get_conversation", fake_get)
     assert conv_client.get("/api/conversations/999999/messages").status_code == 404
+
+
+async def test_history_pages_replay_persisted_ticket_offer(db_session_factory, monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from langchain_core.messages import HumanMessage
+
+    from app.db import repository
+    from app.graph import nodes
+    from app.main import app
+
+    cid = await repository.create_conversation("u1")
+    user_id = await repository.append_message(cid, "user", "我要投诉")
+    state = {"conversation_id": cid, "user_id": "u1",
+             "messages": [HumanMessage("我要投诉", id=f"db-{user_id}")]}
+    old_wording = nodes.COMPLAINT_REPLY
+    monkeypatch.setattr(nodes, "COMPLAINT_REPLY", "我会核实并跟进。")
+    await nodes.log_node({**state, **await nodes.complaint_reply(state)})
+    await nodes.log_node({**state, "answer": old_wording, "suggested_actions": []})
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        url = f"/api/conversations/{cid}/messages"
+        page = (await client.get(url, params={"limit": 1})).json()
+        assert page["items"][0]["content"] == old_wording
+        assert page["items"][0]["can_create_ticket"] is False
+        older = (await client.get(url, params={"before_id": page["next_before_id"]})).json()["items"]
+        assert older[-1]["content"] == "我会核实并跟进。"
+        assert older[-1]["can_create_ticket"] is True
+        assert older[0]["handoff_message_id"] == user_id

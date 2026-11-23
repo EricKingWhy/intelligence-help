@@ -508,11 +508,15 @@ async def log_node(state) -> dict:
     )
     answer = resolve_answer(state)
     if state.get("conversation_id"):
-        offer = next((action for action in state.get("suggested_actions", [])
+        actions = state.get("suggested_actions", [])
+        offer = next((action for action in actions
                       if action.get("type") == "transfer_human" and action.get("message_id")), None)
         evidence = state.get("retrieved_snapshot") or []
         message_id = transfer_action(state).get("message_id")
-        reply_context = {"feedback": {"question": _user_text(state), "evidence": evidence}}
+        reply_context = {
+            "feedback": {"question": _user_text(state), "evidence": evidence},
+            "can_create_ticket": any(action.get("type") == "create_ticket" for action in actions),
+        }
         if service_failure := state.get("service_failure"):
             reply_context["service_failure"] = service_failure
         handoff = None
@@ -538,7 +542,7 @@ async def log_node(state) -> dict:
             if service_failure:
                 context["service_failure"] = service_failure
                 context["retryable"] = any(action.get("type") == "retry_turn"
-                                           for action in state.get("suggested_actions", []))
+                                           for action in actions)
             handoff = (message_id, context)
         reply_id = await repository.append_message(
             state["conversation_id"], "assistant", content=answer or None,
