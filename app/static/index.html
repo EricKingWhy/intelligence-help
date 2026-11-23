@@ -820,8 +820,9 @@
     }
 
     // ---------- ch04:每段回答满意度反馈(👍/👎,点一次点亮 + 已反馈,一次性)----------
-    function addFeedbackBar(bubble, question = null) {
+    function addFeedbackBar(bubble, messageId, question = null) {
       if (bubble.querySelector(".feedback")) return;   // 防重复挂
+      const conversationId = getConversationId();
       const bar = document.createElement("div");
       bar.className = "feedback";
       const up = document.createElement("button");
@@ -854,7 +855,7 @@
         // ch09:反馈接后端——👎 落低置信度问题池进飞轮,👍 后端只记日志;失败静默,UI 行为不变
         fetch("/api/feedback", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ conversation_id: getConversationId(),
+          body: JSON.stringify({ conversation_id: conversationId, message_id: messageId,
                                  rating: chosen === down ? "down" : "up",
                                  question: question ?? userQuestionBefore() }),
         }).catch(() => {});
@@ -1269,7 +1270,10 @@
             on.interrupt && on.interrupt(data);
           }
           else if (data.event === "actions") on.actions && on.actions(data.items || []);
-          else if (data.event === "done") setConversationId(data.conversation_id);
+          else if (data.event === "done") {
+            setConversationId(data.conversation_id);
+            on.done?.(data);
+          }
           else if (data.delta !== undefined) on.delta && on.delta(data.delta, data.replace);
         }
       }
@@ -1282,6 +1286,7 @@
       showTyping(bubble);
       let structured = false, textStarted = false, interrupted = false, raw = "";
       let badgesEl = null, textEl = null, citations = [], actions = [], serviceFailed = false;
+      let replyId;
       function ensureStructure() {
         if (structured) return;
         bubble.innerHTML = "";
@@ -1314,6 +1319,7 @@
         },
         citations: (items) => { citations = items; },
         actions: (items) => { actions = items; },
+        done: (data) => { replyId = data.message_id; },
         interrupt: (data) => {
           interrupted = true;
           if (!structured) { bubble.innerHTML = ""; structured = true; }
@@ -1329,7 +1335,7 @@
       if (!textStarted) { ensureStructure(); textEl.innerHTML = ""; textEl.textContent = "(无回复)"; }
       if (textStarted && citations.length) decorateCitations(textEl, citations);
       if (actions.length) renderActions(bubble, actions);
-      if (textStarted && !serviceFailed) addFeedbackBar(bubble);
+      if (textStarted && !serviceFailed && replyId) addFeedbackBar(bubble, replyId);
     }
 
     async function send(preset) {
@@ -1432,7 +1438,7 @@
           textEl.innerHTML = renderMarkdown(m.content);
           bubble.appendChild(textEl);
           if (m.content.trim() === REPLAY_TICKET_TEXT) renderActions(bubble, [{type: "create_ticket"}]);
-          if (!m.service_failed) addFeedbackBar(bubble, question);
+          if (!m.service_failed) addFeedbackBar(bubble, m.id, question);
         }
       }
       return rows;

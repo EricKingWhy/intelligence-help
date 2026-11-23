@@ -83,17 +83,19 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
         actions = next(event["items"] for event in events if event.get("event") == "actions")
         assert [action["type"] for action in actions] == ["retry_turn", "transfer_human"]
         assert actions[0]["draft"]["message"] == question
-        cid = next(event["conversation_id"] for event in events if event.get("event") == "done")
-        assert (await runtime.get_turn_snapshot(cid))["service_failure"] == diagnosis
+        done = next(event for event in events if event.get("event") == "done")
+        cid = done["conversation_id"]
 
         feedback = await client.post("/api/feedback", json={
-            "conversation_id": cid, "question": question, "rating": "down",
+            "conversation_id": cid, "message_id": done["message_id"], "question": question, "rating": "down",
         })
         assert feedback.is_success and feedback.json()["pooled"] is False
         async with db_session_factory() as session:
             assert await session.scalar(select(func.count()).select_from(LowConfidenceQuestion)) == 0
             message = await session.get(Message, actions[1]["message_id"])
             assert message.handoff_context["service_failure"] == diagnosis
+            reply = await session.get(Message, done["message_id"])
+            assert reply.handoff_context["service_failure"] == diagnosis
         messages = await client.get(f"/api/conversations/{cid}/messages")
         assert messages.json()["items"][-1]["service_failed"] is True
 
@@ -108,7 +110,8 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
         again = await client.post("/api/chat", json={"user_id": "u1", "message": question, "conversation_id": cid})
         assert again.is_success
         assert "retry_turn" not in again.text
-        assert "service_failure" not in await runtime.get_turn_snapshot(cid)
+        messages = await client.get(f"/api/conversations/{cid}/messages")
+        assert "service_failed" not in messages.json()["items"][-1]
         async with db_session_factory() as session:
             item = (await session.scalars(select(LowConfidenceQuestion))).one()
             assert item.source == "retrieval_low_conf"

@@ -4,12 +4,13 @@
 # 简历模版：jianli.xiaolinnote.com
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class FeedbackRequest(BaseModel):
     conversation_id: int
     rating: Literal["up", "down"]
+    message_id: int | None = Field(default=None, gt=0)
     question: str          # 被评价那轮的用户原话(前端从气泡上带上来)
 
 

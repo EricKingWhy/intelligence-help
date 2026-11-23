@@ -49,7 +49,7 @@ async def chat(req: ChatExecution, principal: Principal):
                     elif ev["type"] == "actions":
                         yield _sse({"event": "actions", "items": ev["items"]})
                     elif ev["type"] == "done":
-                        yield _sse({"event": "done", "conversation_id": ev["conversation_id"]})
+                        yield _sse({"event": "done", **{k: v for k, v in ev.items() if k != "type"}})
         except runtime.ConversationBusy as error:
             for f in _sse_error(str(error)):
                 yield f

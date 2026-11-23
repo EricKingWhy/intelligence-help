@@ -2,7 +2,9 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
-"""ch09 入口3:👎 落池(source=user_feedback,快照尽力回捞);👍 只记日志不落库。"""
+"""Feedback route behavior for persisted replies and legacy callers."""
+from types import SimpleNamespace
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -28,40 +30,39 @@ def spy_insert(monkeypatch):
     return calls
 
 
-def _stub_snapshot(monkeypatch, question, snapshot):
-    async def fake_get(cid):
-        return {"question": question, "snapshot": snapshot}
-    monkeypatch.setattr(feedback_api.runtime, "get_turn_snapshot", fake_get)
+def test_down_uses_question_and_evidence_from_selected_reply(client, spy_insert, monkeypatch):
+    question = "退货运费谁承担"
+    evidence = [{"id": 101, "question": "退货运费"}]
 
+    async def selected(cid, message_id):
+        assert (cid, message_id) == (1, 10)
+        return SimpleNamespace(handoff_context={"feedback": {"question": question, "evidence": evidence}})
 
-def test_down_pools_with_snapshot_when_question_matches(client, spy_insert, monkeypatch):
-    snap = [{"question": "x", "answer": "y", "rerank_score": 0.4, "section_path": "s"}]
-    _stub_snapshot(monkeypatch, "猫窝能水洗吗", snap)
-    r = client.post("/api/feedback", json={"conversation_id": 1, "rating": "down", "question": "猫窝能水洗吗"})
-    assert r.status_code == 200 and r.json()["pooled"] is True
+    monkeypatch.setattr(feedback_api.repository, "get_feedback_reply", selected)
+    response = client.post("/api/feedback", json={
+        "conversation_id": 1, "message_id": 10, "question": "客户端气泡文本", "rating": "down",
+    })
+    assert response.status_code == 200 and response.json()["pooled"] is True
+    assert spy_insert[0]["q"] == question
     assert spy_insert[0]["source"] == "user_feedback"
-    assert spy_insert[0]["chunks"] == snap        # 问题对得上 → 快照带走
+    assert spy_insert[0]["chunks"] == evidence
 
 
-def test_down_pools_without_snapshot_when_question_differs(client, spy_insert, monkeypatch):
-    _stub_snapshot(monkeypatch, "另一个问题",
-                   [{"question": "x", "answer": "y", "rerank_score": 0.4, "section_path": "s"}])
-    r = client.post("/api/feedback", json={"conversation_id": 1, "rating": "down", "question": "猫窝能水洗吗"})
-    assert r.status_code == 200
-    assert spy_insert[0]["chunks"] is None        # 对不上 → 空着(尽力而已,不硬塞)
+@pytest.mark.parametrize("message_id", [None, 10])
+def test_legacy_feedback_pools_without_evidence(client, spy_insert, monkeypatch, message_id):
+    async def selected(cid, reply_id):
+        assert (cid, reply_id) == (1, 10)
+        return SimpleNamespace(handoff_context=None)
+
+    monkeypatch.setattr(feedback_api.repository, "get_feedback_reply", selected)
+    response = client.post("/api/feedback", json={
+        "conversation_id": 1, "message_id": message_id, "question": "历史问题", "rating": "down",
+    })
+    assert response.status_code == 200 and response.json()["pooled"] is True
+    assert spy_insert[0]["q"] == "历史问题" and spy_insert[0]["chunks"] is None
 
 
-def test_down_survives_snapshot_failure(client, spy_insert, monkeypatch):
-    async def boom(cid):
-        raise RuntimeError("checkpointer 不可用")
-    monkeypatch.setattr(feedback_api.runtime, "get_turn_snapshot", boom)
-    r = client.post("/api/feedback", json={"conversation_id": 1, "rating": "down", "question": "猫窝能水洗吗"})
-    assert r.status_code == 200                   # 回捞失败不拦落池
-    assert spy_insert[0]["chunks"] is None
-
-
-def test_up_logs_only(client, spy_insert, monkeypatch):
-    _stub_snapshot(monkeypatch, "q", [])
+def test_up_logs_only(client, spy_insert):
     r = client.post("/api/feedback", json={"conversation_id": 1, "rating": "up", "question": "q"})
     assert r.status_code == 200 and r.json()["pooled"] is False
     assert spy_insert == []                       # 👍 不落库
