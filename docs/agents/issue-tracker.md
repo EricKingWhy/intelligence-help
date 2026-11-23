@@ -18,8 +18,9 @@ Issue and PR numbers share a sequence. If a reference does not resolve as an iss
 
 **PRs as a request surface: no.**
 
-## Linked work
+## Wayfinding operations
 
 - For a work map, use a parent issue and GitHub sub-issues. Link an existing child with `gh issue edit <parent> --add-sub-issue <child>`. If sub-issues are unavailable, add the child to the parent's task list and put `Part of #<parent>` in the child.
 - Record blockers using GitHub issue dependencies. To add one with the CLI, get the blocker's database ID with `gh api repos/EricKingWhy/intelligence-help/issues/<blocker> --jq .id`, then pass it as `-F issue_id=<database-id>` to `gh api --method POST repos/EricKingWhy/intelligence-help/issues/<child>/dependencies/blocked_by`. If dependencies are unavailable, use `Blocked by: #<blocker>` in the child.
-- When using Wayfinder, label the parent `wayfinder:map` and children with one of `wayfinder:research`, `wayfinder:prototype`, `wayfinder:grilling`, or `wayfinder:task`. Work from the first open, unassigned child with all blockers closed. Record the result on the child and link it from the parent.
+- Label the map `wayfinder:map` and its children with one of `wayfinder:research`, `wayfinder:prototype`, `wayfinder:grilling`, or `wayfinder:task`.
+- Claim the first open, unassigned child with all blockers closed using `gh issue edit <child> --add-assignee @me`. Record the result on the child and link it from the map.
