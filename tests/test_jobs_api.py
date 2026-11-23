@@ -7,6 +7,7 @@
 这两条是「页面上有重跑按钮但没有 shell」的实证。另加一条注册表自检:每个作业都得是
 仓库 Makefile 里真有的目标,免得页面按钮指向一个不存在的配方。
 """
+import asyncio
 import re
 import pathlib
 
@@ -47,6 +48,51 @@ async def test_running_job_refuses_reentry(client, monkeypatch):
                         jobs.JobRun(status="running", pid=4242))
     resp = await client.post("/api/jobs/kb-build")
     assert resp.status_code == 409 and "正在运行中" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("first_launch_fails", [False, True])
+async def test_job_refuses_reentry_during_startup(client, monkeypatch, tmp_path, first_launch_fails):
+    name = "kb-preview"
+    monkeypatch.setitem(jobs._runs, name, jobs.JobRun())
+    monkeypatch.setattr(jobs, "LOG_DIR", tmp_path)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    launches = []
+
+    class Process:
+        pid = 4242
+
+        async def wait(self):
+            return 0
+
+    async def launch(*args, stdout, **kwargs):
+        launches.append(stdout)
+        if len(launches) == 1:
+            entered.set()
+            await release.wait()
+            if first_launch_fails:
+                raise FileNotFoundError("make")
+        return Process()
+
+    monkeypatch.setattr(jobs.asyncio, "create_subprocess_exec", launch)
+    url = f"/api/jobs/{name}"
+    first = asyncio.create_task(client.post(url))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        second = await asyncio.wait_for(client.post(url), timeout=2)
+    finally:
+        release.set()
+        response = await first
+        if jobs._runs[name].watcher is not None:
+            await jobs._runs[name].watcher
+
+    assert second.status_code == 409
+    assert len(launches) == 1 and launches[0].closed
+    assert response.status_code == (500 if first_launch_fails else 200)
+    if first_launch_fails:
+        assert (await client.post(url)).status_code == 200
+        await jobs._runs[name].watcher
+        assert len(launches) == 2
 
 
 async def test_status_all_covers_registry(client):
