@@ -4,16 +4,26 @@
 # 简历模版：jianli.xiaolinnote.com
 """意图分类的两处约束:提示词不许再提「正文 JSON」(机制只认 tool_calls),
 且当评委用的链路必须显式 temperature=0。"""
+import pytest
+
 from app.core import intent, llm
 from app.core.intent import _Intent
-from app.core.prompts import INTENT_CLASSIFY_SYSTEM
+from app.core.prompts import (
+    EXPAND_QUERIES_SYSTEM,
+    FLYWHEEL_NORMALIZE_SYSTEM,
+    INTENT_CLASSIFY_SYSTEM,
+    SUMMARY_SYSTEM,
+)
 
 
-def test_提示词不再要求正文_JSON():
+@pytest.mark.parametrize("prompt", [INTENT_CLASSIFY_SYSTEM, EXPAND_QUERIES_SYSTEM,
+                                    FLYWHEEL_NORMALIZE_SYSTEM, SUMMARY_SYSTEM],
+                         ids=["intent", "expand", "flywheel", "summary"])
+def test_提示词不再要求正文_JSON(prompt):
     # structured() 走 function_calling,schema 由 bind_tools 的 JSON Schema 承载;
     # 提示词再说「按 JSON 格式返回」会把模型引到正文那条路,tool_calls 为空 → 整轮失败
-    assert "JSON 格式" not in INTENT_CLASSIFY_SYSTEM
-    assert "不得包含任何其他文本" not in INTENT_CLASSIFY_SYSTEM
+    assert "JSON" not in prompt
+    assert "不得包含任何其他文本" not in prompt
 
 
 def test_schema_仍然是九类加_0_1_confidence():
@@ -38,5 +48,5 @@ async def test_classify_用_temperature_0(monkeypatch):
 
     monkeypatch.setattr(llm, "structured", fake_structured)
     out = await intent.classify("我的快递到哪了")
-    assert seen["temperature"] == 0
+    assert seen.get("temperature") == 0
     assert out == {"intent": "物流", "confidence": 0.9}

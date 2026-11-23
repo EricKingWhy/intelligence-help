@@ -41,4 +41,4 @@ def test_证据自评链也传_temperature_0(monkeypatch):
 
     monkeypatch.setattr(llm, "structured", fake_structured)
     selfcheck._chain()
-    assert seen["temperature"] == 0
+    assert seen.get("temperature") == 0
