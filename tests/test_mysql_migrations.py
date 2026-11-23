@@ -2,11 +2,14 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from scripts import migrate_mysql as migrations
 
 
-@pytest.mark.parametrize("scenario", ["empty", "old", "interrupted", "drift", "manual"])
+@pytest.mark.parametrize("scenario", [
+    "empty", "old", "interrupted", "drift", "manual", "missing_baseline", "tracked_missing_baseline",
+])
 async def test_mysql_upgrade_preflight_and_tracking(_test_engine, scenario, capsys):
     name = f"mewhelp_migration_test_{uuid4().hex}"
     async with _test_engine.connect() as raw:
@@ -37,6 +40,18 @@ async def test_mysql_upgrade_preflight_and_tracking(_test_engine, scenario, caps
                 for file in migrations.VERSIONS:
                     for statement in migrations.sql_statements((migrations.SQL_DIR / file).read_text(encoding="utf-8")):
                         await conn.exec_driver_sql(statement)
+            if scenario in {"missing_baseline", "tracked_missing_baseline"}:
+                if scenario == "tracked_missing_baseline":
+                    assert await migrations.migrate(conn, apply=True) == 0
+                await conn.exec_driver_sql("ALTER TABLE messages DROP COLUMN content")
+                with pytest.raises(DBAPIError, match="Unknown column"):
+                    await conn.exec_driver_sql("SELECT content FROM messages LIMIT 1")
+                before = await migrations.inspect_schema(conn)
+                for apply in (False, True):
+                    with pytest.raises(migrations.PreflightError, match=r"messages\.content"):
+                        await migrations.migrate(conn, apply=apply)
+                    assert await migrations.inspect_schema(conn) == before
+                return
 
             status = await migrations.migrate(conn)
             output = capsys.readouterr().out

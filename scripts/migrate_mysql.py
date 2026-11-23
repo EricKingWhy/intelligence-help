@@ -15,20 +15,6 @@ BASELINE = (
     "ch02-ddl.sql", "ch03-ddl.sql", "ch03-staging-review.sql", "ch04-ddl.sql",
     "ch06-ticket-type.sql", "ch07-ddl.sql", "ch08-ddl.sql", "ch09-ddl.sql", "ch10-ddl.sql",
 )
-BASE_COLUMNS = {
-    "conversations": {"id", "summary", "summary_upto_msg_id"},
-    "messages": {"id", "conversation_id"},
-    "tickets": {"ticket_no", "conversation_id", "ticket_type"},
-    "faq": {"id"},
-    "knowledge_chunks": {"id"},
-    "qa_extraction_staging": {"id", "status"},
-    "low_confidence_questions": {"id", "retrieved_chunks", "matched_review_id"},
-    "faith_cases": {"id"},
-    "tool_audit_logs": {"id"},
-    "review_queue": {"id"},
-    "eval_runs": {"id"},
-    "topic_classifications": {"id"},
-}
 # Each tuple describes the catalog objects created by one atomic ALTER in the SQL file.
 VERSIONS = {
     "ch11-reliability.sql": (
@@ -47,6 +33,20 @@ VERSIONS = {
 
 class PreflightError(Exception):
     pass
+
+
+def _required_baseline_columns() -> set[str]:
+    from app.db.models import Base
+
+    # Objects added by tracked migrations are checked separately so old schemas can upgrade.
+    tracked_objects = {
+        name for version in VERSIONS.values() for step in version for name, _ in step
+    }
+    return {
+        f"{table.name}.{column.name}"
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+    } - tracked_objects
 
 
 def sql_statements(source: str) -> list[str]:
@@ -95,10 +95,7 @@ def step_status(catalog, expected):
 async def migrate(conn, *, apply=False):
     catalog, tables, history = await inspect_schema(conn)
     empty = not tables
-    missing_base = [
-        f"{table}.{column}" for table, columns in BASE_COLUMNS.items()
-        for column in sorted(columns) if f"{table}.{column}" not in catalog
-    ]
+    missing_base = sorted(_required_baseline_columns() - catalog.keys())
     if empty:
         print("ch02–ch10: 初始化待执行（仅建表和列）")
     elif missing_base:
