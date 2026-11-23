@@ -44,14 +44,18 @@ def test_list_messages_serializes_dialog(conv_client, monkeypatch):
     async def fake_get(cid):
         return object()
 
-    async def fake_msgs(cid):
-        return [SimpleNamespace(role="user", content="订单1001到哪了", created_at=None, handoff_context=None),
-                SimpleNamespace(role="assistant", content="在路上", created_at=None, handoff_context=None)]
+    async def fake_msgs(cid, *, before_id, limit):
+        assert (cid, before_id, limit) == (7, None, 51)
+        return [SimpleNamespace(id=1, role="user", content="订单1001到哪了",
+                                created_at=None, handoff_context=None),
+                SimpleNamespace(id=2, role="assistant", content="在路上",
+                                created_at=None, handoff_context=None)]
     monkeypatch.setattr(api.repository, "get_conversation", fake_get)
     monkeypatch.setattr(api.repository, "list_dialog_messages", fake_msgs)
 
     r = conv_client.get("/api/conversations/7/messages")
     assert r.status_code == 200
+    assert r.json()["next_before_id"] is None
     assert [(m["role"], m["content"]) for m in r.json()["items"]] == [
         ("user", "订单1001到哪了"), ("assistant", "在路上")]
 

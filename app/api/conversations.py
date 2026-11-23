@@ -3,7 +3,7 @@
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
 """ch07 验收配套:会话列表 + 历史消息回载(只读,前端多会话切换用)。"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.api.auth import Principal, owned_conversation
 from app.db import repository
@@ -20,17 +20,28 @@ async def list_conversations(user_id: str, principal: Principal):
 
 
 @router.get("/api/conversations/{conversation_id}/messages")
-async def list_messages(conversation_id: int, principal: Principal):
+async def list_messages(
+    conversation_id: int, principal: Principal,
+    before_id: int | None = Query(None, gt=0), limit: int = Query(50, ge=1, le=100),
+):
     await owned_conversation(principal, conversation_id)
-    if await repository.get_conversation(conversation_id) is None:
+    if principal is None and await repository.get_conversation(conversation_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
-    msgs = await repository.list_dialog_messages(conversation_id)
-    return {"items": [
-        {"role": m.role, "content": m.content or "",
+    window = await repository.list_dialog_messages(conversation_id, before_id=before_id, limit=limit + 1)
+    page = window[-limit:]
+    previous_question = ""
+    if len(window) > limit and page[0].role == "assistant":
+        previous = window[0]
+        previous_question = (previous.content or "") if previous.role == "user" else (
+            await repository.previous_user_question(conversation_id, previous.id)
+        )
+    return {"next_before_id": page[0].id if len(window) > limit else None,
+            "previous_question": previous_question, "items": [
+        {"id": m.id, "role": m.role, "content": m.content or "",
          "created_at": m.created_at.isoformat() if m.created_at else None,
          **({"handoff_message_id": m.id} if (m.handoff_context or {}).get("offered") else {}),
          **({"retryable": True} if m.role == "user" and (m.handoff_context or {}).get("retryable") else {}),
          **({"service_failed": True} if m.role == "assistant"
             and (m.handoff_context or {}).get("service_failure") else {})}
-        for m in msgs
+        for m in page
     ]}

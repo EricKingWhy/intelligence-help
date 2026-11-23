@@ -5,6 +5,7 @@
 import json
 import logging
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException
@@ -12,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.auth import Principal, owned_conversation
+from app.api.conversation_execution import ResumeExecution
 from app.db import repository
 from app.graph import runtime
 from app.tools.business import owns_order
@@ -20,7 +22,6 @@ from app.schemas.actions import (
     CreateRefundResponse,
     CreateTicketRequest,
     CreateTicketResponse,
-    ResumeRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,10 +73,9 @@ async def create_refund_action(
 
 
 @router.post("/api/actions/resume")
-async def resume_action(req: ResumeRequest, principal: Principal):
+async def resume_action(req: ResumeExecution, principal: Principal):
     """中断续跑(SSE,事件与 /api/chat 同构):订单选择器点选回 order_id;
     工单预览卡回 confirmed(ch08,resume 值为 {"confirmed": bool},agent_tools 按此放行/拒绝)。"""
-    await owned_conversation(principal, req.conversation_id)
     if req.order_id is not None and principal is not None and not owns_order(principal[0], req.order_id):
         raise HTTPException(404, "订单不存在")
     if req.order_id is None and req.confirmed is None:
@@ -118,20 +118,21 @@ async def resume_action(req: ResumeRequest, principal: Principal):
 
     async def event_stream() -> AsyncIterator[str]:
         try:
-            async for ev in runtime.stream_resume(req.conversation_id, resume_value):
-                if ev["type"] == "tool":
-                    yield _sse({"event": "tool", "name": ev["name"]})
-                elif ev["type"] == "delta":
-                    yield _sse({"delta": ev["text"], **({"replace": True} if ev.get("replace") else {})})
-                elif ev["type"] == "citations":
-                    yield _sse({"event": "citations", "items": ev["items"]})
-                elif ev["type"] == "actions":
-                    yield _sse({"event": "actions", "items": ev["items"]})
-                elif ev["type"] == "interrupt":
-                    yield _sse({"event": "interrupt",
-                                **{k: v for k, v in ev.items() if k != "type"}})
-                elif ev["type"] == "done":
-                    yield _sse({"event": "done", "conversation_id": ev["conversation_id"]})
+            async with aclosing(runtime.stream_resume(req.conversation_id, resume_value)) as stream:
+                async for ev in stream:
+                    if ev["type"] == "tool":
+                        yield _sse({"event": "tool", "name": ev["name"]})
+                    elif ev["type"] == "delta":
+                        yield _sse({"delta": ev["text"], **({"replace": True} if ev.get("replace") else {})})
+                    elif ev["type"] == "citations":
+                        yield _sse({"event": "citations", "items": ev["items"]})
+                    elif ev["type"] == "actions":
+                        yield _sse({"event": "actions", "items": ev["items"]})
+                    elif ev["type"] == "interrupt":
+                        yield _sse({"event": "interrupt",
+                                    **{k: v for k, v in ev.items() if k != "type"}})
+                    elif ev["type"] == "done":
+                        yield _sse({"event": "done", "conversation_id": ev["conversation_id"]})
         except runtime.ConversationNotFound:
             yield "event: error\n"
             yield _sse({"message": "会话不存在"})
