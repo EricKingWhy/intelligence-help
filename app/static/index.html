@@ -1013,10 +1013,14 @@
     const ticketErr = document.getElementById("ticketErr");
     const ticketSubmit = document.getElementById("ticketSubmit");
     const ticketCancel = document.getElementById("ticketCancel");
-    let ticketTriggerBtn = null;  // 记住是哪个「建工单」按钮触发的,成功后置灰它
+    const ticketForm = {
+      current: null, submit: ticketSubmit, error: ticketErr, close: closeTicketModal,
+      endpoint: "/api/actions/create-ticket", submitText: "提交工单",
+      successText: "工单已创建:", failureText: "工单创建失败,请稍后重试",
+    };
 
     function openTicketModal(triggerBtn) {
-      ticketTriggerBtn = triggerBtn;
+      ticketForm.current = conversationFormOpening(triggerBtn);
       ticketType.value = "";          // 不预选,强制用户选
       ticketDesc.value = "";          // 留空,用户自己写
       ticketErr.textContent = "";
@@ -1027,7 +1031,7 @@
     }
     function closeTicketModal() {
       ticketMask.classList.remove("open");
-      ticketTriggerBtn = null;
+      ticketForm.current = null;
     }
 
     ticketCancel.addEventListener("click", closeTicketModal);
@@ -1048,39 +1052,46 @@
       return { "Content-Type": "application/json", "Idempotency-Key": key };
     }
 
+    function conversationFormOpening(button) {
+      return {button, conversationId: getConversationId(), view: historyRequest};
+    }
+
+    async function submitConversationForm(form, fields) {
+      const opening = form.current;
+      if (!opening || opening.view !== historyRequest || opening.conversationId !== getConversationId()) return;
+
+      form.error.textContent = "";
+      form.submit.disabled = true;
+      form.submit.textContent = "提交中…";
+
+      const body = JSON.stringify({conversation_id: opening.conversationId, ...fields});
+      const headers = submissionHeaders(opening.button, body);
+      try {
+        const response = await fetch(form.endpoint, {method: "POST", headers, body});
+        if (!response.ok) throw new Error("submission failed");
+        const {ticket_no} = await response.json();
+        if (pendingSubmissions.get(opening.button)?.key === headers["Idempotency-Key"]) {
+          pendingSubmissions.delete(opening.button);
+          opening.button.disabled = true;
+        }
+        if (form.current === opening) form.close();
+        if (opening.view === historyRequest && opening.conversationId === getConversationId()) {
+          addRow("bot").textContent = form.successText + ticket_no;
+        }
+      } catch (e) {
+        if (form.current !== opening) return;
+        form.error.textContent = form.failureText;
+        form.submit.disabled = false;
+        form.submit.textContent = form.submitText;
+      }
+    }
+
     ticketSubmit.addEventListener("click", async () => {
       const type = ticketType.value;
       const desc = ticketDesc.value.trim();
       if (!type) { ticketErr.textContent = "请选择反馈类别"; return; }
       if (!desc) { ticketErr.textContent = "请填写反馈描述"; ticketDesc.focus(); return; }
-      ticketErr.textContent = "";
-      ticketSubmit.disabled = true;
-      ticketSubmit.textContent = "提交中…";
-      try {
-        const button = ticketTriggerBtn || ticketSubmit;
-        const body = JSON.stringify({
-          conversation_id: getConversationId(), description: desc, ticket_type: type,
-        });
-        const resp = await fetch("/api/actions/create-ticket", {
-          method: "POST", headers: submissionHeaders(button, body), body,
-        });
-        const data = await resp.json();
-        if (resp.ok) {
-          pendingSubmissions.delete(button);
-          if (ticketTriggerBtn) ticketTriggerBtn.disabled = true;  // 建成后该气泡的按钮置灰
-          closeTicketModal();
-          addRow("bot").textContent = "工单已创建:" + data.ticket_no;
-          messagesEl.scrollTop = messagesEl.scrollHeight;
-        } else {
-          ticketErr.textContent = "工单创建失败,请稍后重试";
-          ticketSubmit.disabled = false;
-          ticketSubmit.textContent = "提交工单";
-        }
-      } catch (e) {
-        ticketErr.textContent = "工单创建失败,请稍后重试";
-        ticketSubmit.disabled = false;
-        ticketSubmit.textContent = "提交工单";
-      }
+      await submitConversationForm(ticketForm, {description: desc, ticket_type: type});
     });
 
     // ---------- ch06:退款表单弹窗控制(订单号只读 + 固定类目原因下拉)----------
@@ -1090,10 +1101,14 @@
     const refundErr = document.getElementById("refundErr");
     const refundSubmit = document.getElementById("refundSubmit");
     const refundCancel = document.getElementById("refundCancel");
-    let refundTriggerBtn = null;
+    const refundForm = {
+      current: null, submit: refundSubmit, error: refundErr, close: closeRefundModal,
+      endpoint: "/api/actions/create-refund", submitText: "提交退款",
+      successText: "退款申请已提交:", failureText: "退款提交失败,请稍后重试",
+    };
 
     function openRefundModal(triggerBtn, draft) {
-      refundTriggerBtn = triggerBtn;
+      refundForm.current = conversationFormOpening(triggerBtn);
       refundOrder.value = (draft && draft.order_id) || "";
       refundReason.value = "";
       refundErr.textContent = "";
@@ -1101,7 +1116,7 @@
       refundSubmit.textContent = "提交退款";
       refundMask.classList.add("open");
     }
-    function closeRefundModal() { refundMask.classList.remove("open"); refundTriggerBtn = null; }
+    function closeRefundModal() { refundMask.classList.remove("open"); refundForm.current = null; }
     refundCancel.addEventListener("click", closeRefundModal);
     refundMask.addEventListener("click", (e) => { if (e.target === refundMask) closeRefundModal(); });
     document.addEventListener("keydown", (e) => {
@@ -1110,33 +1125,7 @@
     refundSubmit.addEventListener("click", async () => {
       const reason = refundReason.value;
       if (!reason) { refundErr.textContent = "请选择退款原因"; return; }
-      refundErr.textContent = "";
-      refundSubmit.disabled = true;
-      refundSubmit.textContent = "提交中…";
-      try {
-        const button = refundTriggerBtn || refundSubmit;
-        const body = JSON.stringify({ conversation_id: getConversationId(),
-          order_id: refundOrder.value, reason });
-        const resp = await fetch("/api/actions/create-refund", {
-          method: "POST", headers: submissionHeaders(button, body), body,
-        });
-        const data = await resp.json();
-        if (resp.ok) {
-          pendingSubmissions.delete(button);
-          if (refundTriggerBtn) refundTriggerBtn.disabled = true;
-          closeRefundModal();
-          addRow("bot").textContent = "退款申请已提交:" + data.ticket_no;
-          messagesEl.scrollTop = messagesEl.scrollHeight;
-        } else {
-          refundErr.textContent = "退款提交失败,请稍后重试";
-          refundSubmit.disabled = false;
-          refundSubmit.textContent = "提交退款";
-        }
-      } catch (e) {
-        refundErr.textContent = "退款提交失败,请稍后重试";
-        refundSubmit.disabled = false;
-        refundSubmit.textContent = "提交退款";
-      }
+      await submitConversationForm(refundForm, {order_id: refundOrder.value, reason});
     });
 
     // ---------- ch06:订单选择器卡片(interrupt 缺订单号 → 聊天流点选 → resume 续跑)----------
@@ -1474,6 +1463,8 @@
       // 已是当前会话且聊天区有内容才跳过;页面刚刷新时聊天区是空的,点当前会话也要回载
       if (cid === getConversationId() && messagesEl.querySelector(".row")) return;
       const request = ++historyRequest;
+      closeTicketModal();
+      closeRefundModal();
       historyLoading = true;
       setConversationId(cid);
       handoffStatus.hidden = true;
@@ -1517,6 +1508,8 @@
     newChatBtn.addEventListener("click", () => {
       if (sendBtn.disabled) return;
       historyRequest++;
+      closeTicketModal();
+      closeRefundModal();
       historyLoading = false;
       clearConversationId();          // 开新会话:丢弃当前 conversation_id(旧会话仍在侧栏可切回)
       loadHandoffs(null);
