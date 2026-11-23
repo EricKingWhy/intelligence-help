@@ -8,9 +8,83 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import START, StateGraph
+from langgraph.types import interrupt
 
+from app.api.auth import identity
 from app.graph import runtime
+from app.graph.state import ConversationState
 from app.main import app
+
+
+@pytest.mark.parametrize("authenticated", [True, False])
+async def test_order_card_only_resumes_its_own_pause(monkeypatch, authenticated):
+    selected_orders = []
+
+    def choose_order(state):
+        selected = interrupt({"type": "select_order", "orders": [{"order_id": "1001"}]})
+        selected_orders.append(selected)
+        return {"answer": "已选择订单 " + selected}
+
+    builder = StateGraph(ConversationState)
+    builder.add_node("script_reply", choose_order)
+    builder.add_edge(START, "script_reply")
+    graph = builder.compile(checkpointer=InMemorySaver())
+
+    async def conversation(cid):
+        return SimpleNamespace(user_id="u1", summary=None, summary_upto_msg_id=None)
+
+    async def append_message(cid, role, *, content):
+        return 1 if content == "第一轮查询" else 2
+
+    async def no_summary(cid):
+        pass
+
+    monkeypatch.setattr(runtime.repository, "get_conversation", conversation)
+    monkeypatch.setattr(runtime.repository, "append_message", append_message)
+    monkeypatch.setattr(runtime.summarizer, "maybe_schedule_summary", no_summary)
+    monkeypatch.setattr(runtime, "get_graph", lambda: graph)
+    monkeypatch.setitem(app.dependency_overrides, identity, lambda: ("u1", "customer") if authenticated else None)
+    config = {"configurable": {"thread_id": "7"}}
+
+    async with _client() as client:
+        first_card = await client.post("/api/chat", json={
+            "user_id": "u1", "conversation_id": 7, "message": "第一轮查询",
+        })
+        first_pause = (await graph.aget_state(config)).interrupts[0].id
+        body = {"conversation_id": 7, "order_id": "1001", "interrupt_id": first_pause}
+        first_result = await client.post("/api/actions/resume", json=body)
+        assert "已选择订单 1001" in first_result.text
+
+        second_card = await client.post("/api/chat", json={
+            "user_id": "u1", "conversation_id": 7, "message": "第二轮查询",
+        })
+        before = await graph.aget_state(config)
+        current_pause = before.interrupts[0].id
+        assert current_pause != first_pause
+        current = {**body, "interrupt_id": current_pause}
+
+        for invalid, status in (
+            (body, 409),
+            ({**current, "order_id": "2002"}, 409),
+            ({"conversation_id": 7, "order_id": "1001"}, 409),
+            ({**current, "order_id": "999999"}, 404),
+        ):
+            rejected = await client.post("/api/actions/resume", json=invalid)
+            assert rejected.status_code == status
+            after = await graph.aget_state(config)
+            assert after.config == before.config and after.interrupts == before.interrupts
+            assert selected_orders == ["1001"]
+
+        for response, pause in ((first_card, first_pause), (second_card, current_pause)):
+            frame = next(p for p in _data_payloads(response.text.splitlines()) if p.get("kind") == "select_order")
+            assert frame["interrupt_id"] == pause
+            assert frame["orders"] == [{"order_id": "1001"}]
+        continued = await client.post("/api/actions/resume", json=current)
+        assert continued.status_code == 200 and "已选择订单 1001" in continued.text
+        assert selected_orders == ["1001", "1001"]
+        assert not (await graph.aget_state(config)).interrupts
 
 
 @pytest.mark.parametrize("new_conversation", [False, True])
@@ -33,6 +107,14 @@ async def test_conversation_excludes_overlapping_http_graph_operations(monkeypat
         pass
 
     class Graph:
+        pause = SimpleNamespace(
+            id="current-order-selection",
+            value={"type": "select_order", "orders": [{"order_id": "1001"}]},
+        )
+
+        async def aget_state(self, config):
+            return SimpleNamespace(values={"user_id": "u1"}, interrupts=(self.pause,))
+
         async def astream(self, source, config, **kwargs):
             cid = int(config["configurable"]["thread_id"])
             if cid != 7:
@@ -40,11 +122,9 @@ async def test_conversation_excludes_overlapping_http_graph_operations(monkeypat
             if isinstance(source, dict):
                 started.set()
                 await finish.wait()
-                yield "updates", {"__interrupt__": [SimpleNamespace(
-                    value={"type": "select_order", "orders": [{"order_id": "1001"}]},
-                )]}
+                yield "updates", {"__interrupt__": [self.pause]}
             else:
-                assert source.resume == "1001"
+                assert source.resume == {self.pause.id: "1001"}
                 yield "updates", {"script_reply": {"answer": "在路上"}}
 
     monkeypatch.setattr(runtime.repository, "get_conversation", get_conversation)
@@ -55,7 +135,7 @@ async def test_conversation_excludes_overlapping_http_graph_operations(monkeypat
 
     async with _client() as client:
         message = {"user_id": "u1", "conversation_id": 7, "message": "查询订单"}
-        resume = {"conversation_id": 7, "order_id": "1001"}
+        resume = {"conversation_id": 7, "order_id": "1001", "interrupt_id": Graph.pause.id}
         first_body = {**message, "conversation_id": None} if new_conversation else message
         first = asyncio.create_task(client.post("/api/chat", json=first_body))
         try:
