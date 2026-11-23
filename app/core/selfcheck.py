@@ -19,7 +19,7 @@ class _Check(BaseModel):
 
 
 def _chain():
-    return SELF_CHECK_PROMPT | llm.structured(_Check)
+    return SELF_CHECK_PROMPT | llm.structured(_Check, temperature=0)
 
 
 async def check_sufficient(query: str, evidence_texts: list[str]) -> dict:

@@ -25,7 +25,7 @@ async def classify(query: str, history: str = "") -> dict:
     """九类意图 + confidence(ch08 增「人工」:明确要求建工单/转人工)。扁平字段避开 glm 嵌套 502;
     解析失败/越界 → 归「其他」(最保守兜底,替换 ch05 的回退闲聊)。
     模型默认走 settings.intent_model(空则回落 chat_model)——先求准。"""
-    model = llm.structured(_Intent, model=settings.intent_model or None)
+    model = llm.structured(_Intent, model=settings.intent_model or None, temperature=0)
     try:
         r: _Intent = await (INTENT_CLASSIFY_PROMPT | model).ainvoke(
             {"query": query, "history": history or "(无)"})
