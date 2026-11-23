@@ -40,7 +40,7 @@ async def test_feedback_keeps_each_repeated_question_bound_to_its_reply(db_sessi
             })
             response.raise_for_status()
             events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
-            return next(event for event in events if event["event"] == "done")
+            return next(event for event in events if event.get("event") == "done")
 
         async def down(cid, message_id):
             return await client.post("/api/feedback", json={
