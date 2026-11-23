@@ -187,41 +187,60 @@ async def count_messages_after(conversation_id: int, after_id: int | None) -> in
         return int((await s.execute(q)).scalar_one())
 
 
-async def list_dialog_messages(conversation_id: int) -> list[Message]:
-    """user/assistant 消息按 id 升序(摘要任务源数据;tool 行不落库,过滤一道保险)。"""
+async def list_dialog_messages(
+    conversation_id: int, *, before_id: int | None = None, limit: int | None = None,
+) -> list[Message]:
+    """Return dialog messages in display order, optionally taking only the newest rows."""
+    query = select(Message).where(
+        Message.conversation_id == conversation_id, Message.role.in_(("user", "assistant"))
+    )
+    if before_id is not None:
+        query = query.where(Message.id < before_id)
+    if limit is not None:
+        query = query.order_by(Message.id.desc()).limit(limit)
+    else:
+        query = query.order_by(Message.id)
     async with db.async_session() as s:
-        result = await s.execute(
-            select(Message)
-            .where(Message.conversation_id == conversation_id,
-                   Message.role.in_(("user", "assistant")))
-            .order_by(Message.id)
+        rows = list((await s.scalars(query)).all())
+    return rows if limit is None else rows[::-1]
+
+
+async def previous_user_question(conversation_id: int, before_id: int) -> str:
+    async with db.async_session() as s:
+        result = await s.scalar(
+            select(Message.content)
+            .where(Message.conversation_id == conversation_id, Message.role == "user", Message.id < before_id)
+            .order_by(Message.id.desc()).limit(1)
         )
-        return list(result.scalars())
+    return result or ""
 
 
 async def list_conversations(user_id: str, limit: int = 50) -> list[dict]:
     """某用户的会话列表(新在前,带首问预览 + 有无摘要标记),前端多会话切换用。"""
+    preview = (
+        select(func.substr(Message.content, 1, 40))
+        .where(Message.conversation_id == Conversation.id, Message.role == "user")
+        .order_by(Message.id)
+        .limit(1)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+    query = (
+        select(Conversation.id, Conversation.status, func.length(Conversation.summary).label("summary_length"),
+               Conversation.updated_at, preview.label("preview"))
+        .where(Conversation.user_id == user_id)
+        .order_by(Conversation.id.desc())
+        .limit(limit)
+    )
     async with db.async_session() as s:
-        convs = list((await s.execute(
-            select(Conversation).where(Conversation.user_id == user_id)
-            .order_by(Conversation.id.desc()).limit(limit)
-        )).scalars())
-        out = []
-        for c in convs:
-            if c.user_id != user_id:
-                continue
-            first = (await s.execute(
-                select(Message.content)
-                .where(Message.conversation_id == c.id, Message.role == "user")
-                .order_by(Message.id).limit(1)
-            )).scalar()
-            out.append({
-                "id": c.id, "status": c.status,
-                "preview": (first or "(空会话)")[:40],
-                "has_summary": bool(c.summary),
-                "updated_at": c.updated_at.isoformat() if c.updated_at else None,
-            })
-        return out
+        return [
+            {
+                "id": row.id, "status": row.status, "preview": row.preview or "(空会话)",
+                "has_summary": bool(row.summary_length),
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in (await s.execute(query))
+        ]
 
 
 async def update_conversation_summary(conversation_id: int, summary: str, upto_msg_id: int) -> None:

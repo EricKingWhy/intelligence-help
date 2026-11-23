@@ -643,8 +643,8 @@
       if (e) e.remove();
     }
 
-    function addRow(role) {
-      clearEmptyState();
+    function addRow(role, target = messagesEl) {
+      if (target === messagesEl) clearEmptyState();
       const row = document.createElement("div");
       row.className = "row " + role;
       if (role === "bot") {
@@ -656,8 +656,8 @@
       const bubble = document.createElement("div");
       bubble.className = "bubble";
       row.appendChild(bubble);
-      messagesEl.appendChild(row);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      target.appendChild(row);
+      if (target === messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
       return bubble;
     }
 
@@ -816,7 +816,7 @@
     }
 
     // ---------- ch04:每段回答满意度反馈(👍/👎,点一次点亮 + 已反馈,一次性)----------
-    function addFeedbackBar(bubble) {
+    function addFeedbackBar(bubble, question = null) {
       if (bubble.querySelector(".feedback")) return;   // 防重复挂
       const bar = document.createElement("div");
       bar.className = "feedback";
@@ -852,7 +852,7 @@
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ conversation_id: getConversationId(),
                                  rating: chosen === down ? "down" : "up",
-                                 question: userQuestionBefore() }),
+                                 question: question ?? userQuestionBefore() }),
         }).catch(() => {});
       }
       up.addEventListener("click", () => give(up, down));
@@ -1335,7 +1335,7 @@
     }
 
     async function send(preset) {
-      if (sendBtn.disabled) return;
+      if (sendBtn.disabled || historyLoading) return;
       const message = (preset ?? inputEl.value).trim();
       if (!message) return;
       inputEl.value = "";
@@ -1411,10 +1411,66 @@
     }
 
     const REPLAY_TICKET_TEXT = "非常抱歉给您带来了不好的体验,我理解您的心情。您可以选择转接人工客服,或让我为您登记一张工单跟进处理。";
+    let historyRequest = 0;
+    let historyLoading = false;
+
+    function renderHistory(items, previousQuestion) {
+      const rows = document.createDocumentFragment();
+      let question = previousQuestion || "";
+      for (const m of items || []) {
+        if (!m.content) continue;
+        const bubble = addRow(m.role === "user" ? "user" : "bot", rows);
+        if (m.role === "user") {
+          bubble.textContent = m.content;
+          question = m.content;
+          if (m.handoff_message_id) {
+            const actions = [{type: "transfer_human", message_id: m.handoff_message_id}];
+            if (m.retryable) actions.unshift({type: "retry_turn", draft: {message: m.content}});
+            renderActions(bubble, actions);
+          }
+        } else {
+          const textEl = document.createElement("div");
+          textEl.className = "bubble-text";
+          textEl.innerHTML = renderMarkdown(m.content);
+          bubble.appendChild(textEl);
+          if (m.content.trim() === REPLAY_TICKET_TEXT) renderActions(bubble, [{type: "create_ticket"}]);
+          if (!m.service_failed) addFeedbackBar(bubble, question);
+        }
+      }
+      return rows;
+    }
+
+    function olderMessages(cid, cursor, request) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "action-btn";
+      button.textContent = "加载更早的消息";
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const response = await fetch("/api/conversations/" + cid + "/messages?before_id=" + cursor);
+          if (!response.ok) throw new Error("history page request failed");
+          const page = await response.json();
+          if (request !== historyRequest || cid !== getConversationId()) return;
+          const height = messagesEl.scrollHeight;
+          const top = messagesEl.scrollTop;
+          const rows = renderHistory(page.items, page.previous_question);
+          if (page.next_before_id) rows.prepend(olderMessages(cid, page.next_before_id, request));
+          button.replaceWith(rows);
+          messagesEl.scrollTop = top + messagesEl.scrollHeight - height;
+        } catch (e) {
+          button.textContent = "重新加载更早的消息";
+          button.disabled = false;
+        }
+      });
+      return button;
+    }
 
     async function switchConversation(cid) {
       // 已是当前会话且聊天区有内容才跳过;页面刚刷新时聊天区是空的,点当前会话也要回载
       if (cid === getConversationId() && messagesEl.querySelector(".row")) return;
+      const request = ++historyRequest;
+      historyLoading = true;
       setConversationId(cid);
       handoffStatus.hidden = true;
       handoffStatus.open = false;
@@ -1422,35 +1478,19 @@
       messagesEl.innerHTML = "";
       try {
         const r = await fetch("/api/conversations/" + cid + "/messages");
-        if (cid !== getConversationId()) return;
+        if (request !== historyRequest || cid !== getConversationId()) return;
         if (r.status === 404) {
           clearConversationId();
           loadHandoffs(null);
         } else if (r.ok) {
-          const {items} = await r.json();
-          if (cid !== getConversationId()) return;
-          for (const m of items || []) {
-            if (!m.content) continue;
-            if (m.role === "user") {
-              const bubble = addRow("user");
-              bubble.textContent = m.content;
-              if (m.handoff_message_id) {
-                const historyActions = [{type: "transfer_human", message_id: m.handoff_message_id}];
-                if (m.retryable) historyActions.unshift({type: "retry_turn", draft: {message: m.content}});
-                renderActions(bubble, historyActions);
-              }
-            } else {
-              const bubble = addRow("bot");
-              const textEl = document.createElement("div");
-              textEl.className = "bubble-text";
-              textEl.innerHTML = renderMarkdown(m.content);
-              bubble.appendChild(textEl);
-              if (m.content.trim() === REPLAY_TICKET_TEXT) renderActions(bubble, [{type: "create_ticket"}]);
-              if (!m.service_failed) addFeedbackBar(bubble);
-            }
-          }
+          const {items, next_before_id, previous_question} = await r.json();
+          if (request !== historyRequest || cid !== getConversationId()) return;
+          if (next_before_id) messagesEl.appendChild(olderMessages(cid, next_before_id, request));
+          messagesEl.appendChild(renderHistory(items, previous_question));
         }
       } catch (e) { /* 历史加载失败仍可继续聊 */ }
+      finally { if (request === historyRequest) historyLoading = false; }
+      if (request !== historyRequest) return;
       if (!messagesEl.children.length) renderEmptyState();
       messagesEl.scrollTop = messagesEl.scrollHeight;
       loadConversations();   // 刷新 active 高亮
@@ -1471,6 +1511,9 @@
       }
     });
     newChatBtn.addEventListener("click", () => {
+      if (sendBtn.disabled) return;
+      historyRequest++;
+      historyLoading = false;
       clearConversationId();          // 开新会话:丢弃当前 conversation_id(旧会话仍在侧栏可切回)
       loadHandoffs(null);
       renderEmptyState();
