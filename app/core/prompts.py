@@ -192,8 +192,6 @@ INTENT_CLASSIFY_SYSTEM = """## 角色
 - 「帮我写首诗」→ 其他(与电商客服无关又不该塞进闲聊业务处理)。
 
 ## 输出要求
-必须使用以下 JSON 格式返回,不得包含任何其他文本:
-{{"intent": "...", "confidence": 0.0-1.0}}
 intent 只能是上面九类中文标签之一;confidence 是你对该判断的把握(0-1)。"""
 
 INTENT_CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
@@ -214,8 +212,7 @@ EXPAND_QUERIES_SYSTEM = """## 角色
 3. 每条查询尽量短、含关键词,彼此侧重点不同。
 
 ## 输出要求
-严格 3 条,必须使用以下 JSON 格式返回,不得包含任何其他文本:
-{{"queries": ["蓝牙耳机退货政策", "蓝牙耳机无理由退换货条件", "耳机退货时间限制"]}}"""
+queries 严格 3 条,彼此侧重点不同,例如:蓝牙耳机退货政策 / 蓝牙耳机无理由退换货条件 / 耳机退货时间限制"""
 
 EXPAND_QUERIES_PROMPT = ChatPromptTemplate.from_messages(
     [("system", EXPAND_QUERIES_SYSTEM), ("human", "用户问题:{query}")]
@@ -245,8 +242,7 @@ FLYWHEEL_NORMALIZE_SYSTEM = """## 角色
 3. ai_suggested_answer:给这个标准问题写一条简短的示例答案备查(客服口吻,不臆造政策数字,
    拿不准的表述用「以平台售后规则为准」)。
 
-严格输出 JSON,不含其他文本:
-{{"normalized_question": "...", "matched_question_id": 128 或 null, "ai_suggested_answer": "..."}}"""
+三个字段一次给全:normalized_question(标准化后的问题)、matched_question_id(命中的候选 id,整数;都不是填 null)、ai_suggested_answer(示例答案)。"""
 
 FLYWHEEL_NORMALIZE_PROMPT = ChatPromptTemplate.from_messages(
     [("system", FLYWHEEL_NORMALIZE_SYSTEM),
@@ -260,8 +256,7 @@ SUMMARY_SYSTEM = """## 角色
 - 只提炼事实与诉求:问过哪款商品、报过的订单号/手机号、用户的明确诉求、还没解决的问题
 - 对话里没出现的内容一个字不许编;寒暄闲聊不留
 - 已有旧摘要时,把旧摘要与新对话合并成一份;旧摘要里的订单号、手机号等事实不得丢
-- 长度几十到一两百字
-- 严格输出 JSON:{{"summary": "string"}}"""
+- 长度几十到一两百字,填进 summary 字段"""
 
 SUMMARY_PROMPT = ChatPromptTemplate.from_messages(
     [("system", SUMMARY_SYSTEM),
