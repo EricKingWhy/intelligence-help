@@ -91,6 +91,7 @@ class JobRun:
     started_at: str | None = None
     finished_at: str | None = None
     returncode: int | None = None
+    starting: bool = field(default=False, repr=False)
     proc: asyncio.subprocess.Process | None = field(default=None, repr=False)
     watcher: asyncio.Task | None = field(default=None, repr=False)
 
@@ -107,10 +108,12 @@ def log_path(name: str) -> Path:
 
 
 async def start(name: str) -> JobRun:
-    """发起一次运行。同名作业未结束时拒绝重入(返回 RuntimeError),避免两份进程抢同一批产物。"""
+    """发起一次运行。同名作业启动中或尚未退出时拒绝重入。"""
     spec = JOBS[name]
     run = _run(name)
-    if run.status == "running":
+    if run.starting:
+        raise RuntimeError(f"{spec.title}正在启动中，请稍后再试")
+    if run.status == "running" or run.proc is not None:
         raise RuntimeError(f"{spec.title}正在运行中(pid {run.pid}),等它跑完再发起")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -119,6 +122,8 @@ async def start(name: str) -> JobRun:
               f"# {dt.datetime.now().isoformat(timespec='seconds')} 由后台页发起\n\n")
     path.write_text(header, encoding="utf-8")          # 每次覆盖:窗口里只看本次
     fh = path.open("a", encoding="utf-8", buffering=1)
+    # ponytail: 作业状态在单个服务进程内共享，多 worker 部署需要共享作业状态。
+    run.starting = True
     try:
         proc = await asyncio.create_subprocess_exec(
             *spec.argv, cwd=REPO_ROOT, stdout=fh, stderr=asyncio.subprocess.STDOUT,
@@ -126,9 +131,11 @@ async def start(name: str) -> JobRun:
             # 独立会话:kill 时能连 make → uv → python 整条链一起收,不留孤儿进程
             start_new_session=True,
         )
-    except Exception:
+    except BaseException:
         fh.close()
         raise
+    finally:
+        run.starting = False
 
     run.status, run.pid = "running", proc.pid
     run.started_at = dt.datetime.now().isoformat(timespec="seconds")
