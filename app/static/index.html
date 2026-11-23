@@ -607,14 +607,18 @@
     }
 
     function getConversationId() {
-      const v = localStorage.getItem(CONV_KEY);
+      const v = sessionStorage.getItem(CONV_KEY) ?? localStorage.getItem(CONV_KEY);
       return v ? Number(v) : null;
     }
     function setConversationId(id) {
-      if (id != null) localStorage.setItem(CONV_KEY, String(id));
+      if (id != null) {
+        sessionStorage.setItem(CONV_KEY, String(id));
+        localStorage.setItem(CONV_KEY, String(id));
+      }
     }
     function clearConversationId() {
-      localStorage.removeItem(CONV_KEY);
+      if (String(getConversationId()) === localStorage.getItem(CONV_KEY)) localStorage.removeItem(CONV_KEY);
+      sessionStorage.setItem(CONV_KEY, "");
     }
 
     function renderEmptyState() {
