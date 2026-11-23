@@ -11,9 +11,12 @@ URL = "http://localhost:19353"
 PAGE = Path(__file__).resolve().parents[2] / "app/static/index.html"
 
 
+def form_trigger(page, action):
+    return page.get_by_role("button", name="建工单" if action == "ticket" else "提交退款工单", exact=True)
+
+
 async def open_form(page, action):
-    await page.get_by_role("button", name="建工单" if action == "ticket" else "提交退款工单",
-                           exact=True).click()
+    await form_trigger(page, action).click()
     if action == "ticket":
         await page.locator("#ticketType").select_option("咨询")
         await page.locator("#ticketDesc").fill("测试描述")
@@ -74,6 +77,7 @@ async def check(browser, action, succeeds, switch):
         await asyncio.wait_for(submitted.wait(), timeout=5)
         if switch:
             await page.keyboard.press("Escape")
+            await expect(form_trigger(page, action)).to_be_disabled()
             await ask("会话 B")
         async with page.expect_response(lambda response: response.url.endswith(endpoint)):
             release.set()
@@ -82,10 +86,13 @@ async def check(browser, action, succeeds, switch):
         if switch:
             await expect(mask).to_be_visible()
             await expect(error).to_be_empty()
+            await expect(button).to_be_enabled()
+            await expect(form_trigger(page, action)).to_be_enabled()
             await expect(page.get_by_text("QA-17", exact=False)).to_have_count(0)
         else:
             if not succeeds:
                 await expect(error).to_contain_text("失败")
+                await expect(form_trigger(page, action)).to_be_enabled()
                 await button.click()
             await expect(page.get_by_text("QA-17", exact=False)).to_be_visible()
             if not succeeds:

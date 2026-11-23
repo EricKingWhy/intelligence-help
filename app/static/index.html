@@ -1063,6 +1063,7 @@
       form.error.textContent = "";
       form.submit.disabled = true;
       form.submit.textContent = "提交中…";
+      opening.button.disabled = true;
 
       const body = JSON.stringify({conversation_id: opening.conversationId, ...fields});
       const headers = submissionHeaders(opening.button, body);
@@ -1070,15 +1071,14 @@
         const response = await fetch(form.endpoint, {method: "POST", headers, body});
         if (!response.ok) throw new Error("submission failed");
         const {ticket_no} = await response.json();
-        if (pendingSubmissions.get(opening.button)?.key === headers["Idempotency-Key"]) {
-          pendingSubmissions.delete(opening.button);
-          opening.button.disabled = true;
-        }
+        pendingSubmissions.delete(opening.button);
         if (form.current === opening) form.close();
         if (opening.view === historyRequest && opening.conversationId === getConversationId()) {
           addRow("bot").textContent = form.successText + ticket_no;
+          messagesEl.scrollTop = messagesEl.scrollHeight;
         }
       } catch (e) {
+        opening.button.disabled = false;
         if (form.current !== opening) return;
         form.error.textContent = form.failureText;
         form.submit.disabled = false;
