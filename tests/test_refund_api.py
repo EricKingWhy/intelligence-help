@@ -2,6 +2,9 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
+from types import SimpleNamespace
+
+
 def test_create_refund_writes_ticket(client, monkeypatch):
     async def fake_create(cid, desc, ttype):
         assert cid == 7 and ttype == "退款" and "1001" in desc and "质量问题" in desc
@@ -22,14 +25,23 @@ def test_create_refund_rejects_bad_reason(client):
 
 
 def test_resume_endpoint_streams(client, monkeypatch):
+    pause = SimpleNamespace(id="order-selection",
+                            value={"type": "select_order", "orders": [{"order_id": "1001"}]})
+
+    async def get_state(config):
+        return SimpleNamespace(values={"user_id": "u1"}, interrupts=[pause])
+
     async def fake_stream_resume(cid, resume_value):
-        assert cid == 3 and resume_value == "1001"
+        assert cid == 3 and resume_value == {pause.id: "1001"}
         yield {"type": "delta", "text": "这一单可以退款"}
         yield {"type": "actions", "items": [{"type": "refund_form", "draft": {"order_id": "1001"}}]}
         yield {"type": "done", "conversation_id": 3}
     from app.api import actions
+    monkeypatch.setattr(actions.runtime, "get_graph", lambda: SimpleNamespace(aget_state=get_state))
     monkeypatch.setattr(actions.runtime, "stream_resume", fake_stream_resume)
-    r = client.post("/api/actions/resume", json={"conversation_id": 3, "order_id": "1001"})
+    r = client.post("/api/actions/resume", json={
+        "conversation_id": 3, "order_id": "1001", "interrupt_id": pause.id,
+    })
     assert r.status_code == 200
     body = r.text
     assert "这一单可以退款" in body

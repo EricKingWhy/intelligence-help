@@ -139,7 +139,11 @@ def _interrupt_payload(state: dict):
     intr = state.get("__interrupt__")
     if not intr:
         return None
-    return intr[0].value
+    item = intr[0]
+    payload = item.value
+    if payload.get("type") == "select_order":
+        return {**payload, "interrupt_id": item.id}
+    return payload
 
 
 async def run_turn(user_id, message, conversation_id) -> dict:
@@ -189,12 +193,12 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
                         yield {"type": "delta", "text": text}
             elif mode == "updates":
                 if "__interrupt__" in chunk:
-                    payload = chunk["__interrupt__"][0].value
+                    payload = _interrupt_payload(chunk)
                     # 带上 conversation_id:中断时不发 done 帧,前端要靠这个才知道续跑用哪个会话。
                     # ch08:负载按中断类型透传(select_order 带 orders,confirm_ticket 带 preview),
                     # 前端按 kind 分发。
                     ev = {"type": "interrupt", "kind": payload.get("type", ""), "conversation_id": cid}
-                    for k in ("orders", "preview"):
+                    for k in ("orders", "preview", "interrupt_id"):
                         if payload.get(k) is not None:
                             ev[k] = payload[k]
                     interrupt = ev

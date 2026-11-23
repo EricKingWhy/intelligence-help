@@ -168,6 +168,7 @@ async def test_stream_turn_emits_interrupt_event(monkeypatch, no_summary_task):
     monkeypatch.setattr(runtime.repository, "append_message", fake_append)
 
     class Intr:
+        id = "order-selection"
         def __init__(self, value): self.value = value
 
     class FakeGraph:
@@ -181,6 +182,7 @@ async def test_stream_turn_emits_interrupt_event(monkeypatch, no_summary_task):
     intr = [e for e in events if e["type"] == "interrupt"]
     assert intr and intr[0]["kind"] == "select_order"
     assert intr[0]["orders"] == [{"order_id": "1001"}]
+    assert intr[0]["interrupt_id"] == "order-selection"
     assert intr[0]["conversation_id"] == 9   # 中断带会话号供前端续跑(无 done 帧)
 
 

@@ -74,14 +74,14 @@ async def create_refund_action(
 
 @router.post("/api/actions/resume")
 async def resume_action(req: ResumeExecution, principal: Principal):
-    """中断续跑(SSE,事件与 /api/chat 同构):订单选择器点选回 order_id;
+    """中断续跑(SSE,事件与 /api/chat 同构):订单选择器点选回 interrupt_id 与 order_id;
     工单预览卡回 confirmed(ch08,resume 值为 {"confirmed": bool},agent_tools 按此放行/拒绝)。"""
-    if req.order_id is not None and principal is not None and not owns_order(principal[0], req.order_id):
-        raise HTTPException(404, "订单不存在")
     if req.order_id is None and req.confirmed is None:
         raise HTTPException(status_code=400, detail="order_id 与 confirmed 至少传一个")
     if req.order_id is not None and req.confirmed is not None:
         raise HTTPException(400, "请选择一种续跑操作")
+    if req.order_id is not None and req.interrupt_id is None:
+        raise HTTPException(409, "订单选择卡已失效，请重新发起查询")
     if principal is not None and req.confirmed is not None and req.confirmation_id is None:
         raise HTTPException(422, "工单确认需要确认标识")
     if req.confirmed and req.confirmation_id:
@@ -93,25 +93,33 @@ async def resume_action(req: ResumeExecution, principal: Principal):
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(replay(), media_type="text/event-stream")
-    if principal is not None or req.confirmation_id:
+    if req.order_id is not None or principal is not None or req.confirmation_id:
         state = await runtime.get_graph().aget_state(
             {"configurable": {"thread_id": str(req.conversation_id)}},
         )
         if principal is not None and state.values.get("user_id") != principal[0]:
             raise HTTPException(409, "会话没有可续跑的步骤")
-        if principal is not None and req.order_id is not None and not any(
-            isinstance(item.value, dict) and item.value.get("type") == "select_order"
-            for item in state.interrupts
-        ):
-            raise HTTPException(409, "会话没有待选择的订单")
+        if req.order_id is not None:
+            if not owns_order(state.values.get("user_id", ""), req.order_id):
+                raise HTTPException(404, "订单不存在")
+            selection = next((
+                item.value for item in state.interrupts
+                if item.id == req.interrupt_id and isinstance(item.value, dict)
+                and item.value.get("type") == "select_order"
+            ), None)
+            if selection is None:
+                raise HTTPException(409, "订单选择卡已失效，请重新发起查询")
+            if not any(order["order_id"] == req.order_id for order in selection.get("orders", [])):
+                raise HTTPException(409, "请选择当前卡片中的订单")
         if req.confirmation_id and not any(
             isinstance(item.value, dict)
             and (item.value.get("preview") or {}).get("confirmation_id") == req.confirmation_id
             for item in state.interrupts
         ):
             raise HTTPException(409, "工单确认已失效")
-    resume_value = req.order_id
-    if resume_value is None:
+    if req.order_id is not None:
+        resume_value = {req.interrupt_id: req.order_id}
+    else:
         resume_value = {"confirmed": bool(req.confirmed)}
         if req.confirmation_id:
             resume_value["confirmation_id"] = req.confirmation_id

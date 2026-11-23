@@ -1149,7 +1149,7 @@
         card.addEventListener("click", async () => {
           wrap.querySelectorAll(".order-card").forEach((c) => (c.disabled = true));
           card.classList.add("picked");
-          if (await (onPick || pickThenResume)(o) === false) {
+          if (await onPick(o) === false) {
             card.classList.remove("picked");
             wrap.querySelectorAll(".order-card").forEach((c) => (c.disabled = false));
           }
@@ -1161,7 +1161,8 @@
     }
 
     // ch06:点完续跑图(有 interrupt 挂着)
-    async function pickThenResume(o) {
+    async function pickThenResume(o, conversationId, interruptId) {
+      if (sendBtn.disabled) return false;
       const selection = addRow("user");
       selection.textContent = "选择订单 " + o.order_id;
       const nb = addRow("bot");
@@ -1169,7 +1170,8 @@
       try {
         await streamInto(nb, () => fetch("/api/actions/resume", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ conversation_id: getConversationId(), order_id: o.order_id }),
+          body: JSON.stringify({conversation_id: conversationId, order_id: o.order_id,
+            interrupt_id: interruptId}),
         }));
       } catch (e) {
         nb.className = "bubble error";
@@ -1317,7 +1319,10 @@
           if (!structured) { bubble.innerHTML = ""; structured = true; }
           // ch08:中断按 kind 分发——select_order 弹订单卡,confirm_ticket 弹工单预览卡
           if (data.kind === "confirm_ticket") renderTicketConfirm(bubble, data.preview || {});
-          else renderOrderCards(bubble, data.orders || []);
+          else if (data.kind === "select_order") {
+            renderOrderCards(bubble, data.orders || [],
+              (order) => pickThenResume(order, data.conversation_id, data.interrupt_id));
+          }
         },
       });
       if (interrupted) return;
