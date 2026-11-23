@@ -5,14 +5,15 @@
 import json
 import logging
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.auth import Principal, owned_conversation
+from app.api.auth import Principal
+from app.api.conversation_execution import ChatExecution
 from app.graph import runtime
-from app.schemas.chat import ChatRequest
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -28,27 +29,27 @@ def _sse_error(message: str) -> AsyncIterator[str]:
 
 
 @router.post("/api/chat")
-async def chat(req: ChatRequest, principal: Principal):
-    await owned_conversation(principal, req.conversation_id)
+async def chat(req: ChatExecution, principal: Principal):
     if principal is not None:
         req = req.model_copy(update={"user_id": principal[0]})
     async def event_stream() -> AsyncIterator[str]:
         try:
-            async for ev in runtime.stream_turn(req.user_id, req.message, req.conversation_id):
-                if ev["type"] == "tool":
-                    yield _sse({"event": "tool", "name": ev["name"]})
-                elif ev["type"] == "delta":
-                    yield _sse({"delta": ev["text"], **({"replace": True} if ev.get("replace") else {})})
-                elif ev["type"] == "citations":
-                    yield _sse({"event": "citations", "items": ev["items"]})
-                elif ev["type"] == "interrupt":
-                    # ch08:负载透传(select_order 带 orders / confirm_ticket 带 preview),前端按 kind 分发
-                    yield _sse({"event": "interrupt",
-                                **{k: v for k, v in ev.items() if k != "type"}})
-                elif ev["type"] == "actions":
-                    yield _sse({"event": "actions", "items": ev["items"]})
-                elif ev["type"] == "done":
-                    yield _sse({"event": "done", "conversation_id": ev["conversation_id"]})
+            async with aclosing(runtime.stream_turn(req.user_id, req.message, req.conversation_id)) as stream:
+                async for ev in stream:
+                    if ev["type"] == "tool":
+                        yield _sse({"event": "tool", "name": ev["name"]})
+                    elif ev["type"] == "delta":
+                        yield _sse({"delta": ev["text"], **({"replace": True} if ev.get("replace") else {})})
+                    elif ev["type"] == "citations":
+                        yield _sse({"event": "citations", "items": ev["items"]})
+                    elif ev["type"] == "interrupt":
+                        # ch08:负载透传(select_order 带 orders / confirm_ticket 带 preview),前端按 kind 分发
+                        yield _sse({"event": "interrupt",
+                                    **{k: v for k, v in ev.items() if k != "type"}})
+                    elif ev["type"] == "actions":
+                        yield _sse({"event": "actions", "items": ev["items"]})
+                    elif ev["type"] == "done":
+                        yield _sse({"event": "done", "conversation_id": ev["conversation_id"]})
         except runtime.ConversationNotFound:
             for f in _sse_error("会话不存在"):
                 yield f

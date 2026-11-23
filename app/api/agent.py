@@ -8,10 +8,11 @@ from fastapi import APIRouter, HTTPException
 from langchain_core.messages import AIMessage, ToolMessage
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.auth import Principal, owned_conversation
+from app.api.auth import Principal
+from app.api.conversation_execution import AgentExecution
 from app.graph import runtime
 from app.graph.nodes import resolve_answer
-from app.schemas.agent import AgentRequest, AgentResponse, ToolCallView, ToolResultView
+from app.schemas.agent import AgentResponse, ToolCallView, ToolResultView
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -32,8 +33,7 @@ def _views_from_state(state):
 
 
 @router.post("/api/agent", response_model=AgentResponse)
-async def run_agent(req: AgentRequest, principal: Principal) -> AgentResponse:
-    await owned_conversation(principal, req.conversation_id)
+async def run_agent(req: AgentExecution, principal: Principal) -> AgentResponse:
     if principal is not None:
         req = req.model_copy(update={"user_id": principal[0]})
     try:

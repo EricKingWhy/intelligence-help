@@ -4,6 +4,7 @@
 # 简历模版：jianli.xiaolinnote.com
 import logging
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -156,46 +157,52 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
     config = {"configurable": {"thread_id": str(cid)},
               "metadata": {"langfuse_session_id": str(cid)}}
     actions: list = []
-    async for mode, chunk in get_graph().astream(
-        stream_source, config, stream_mode=["messages", "updates"],
-    ):
-        if mode == "messages":
-            msg, meta = chunk
-            if meta.get("langgraph_node") in ANSWER_NODES:
-                text = msg.content if isinstance(msg.content, str) else ""
-                if text:
-                    yield {"type": "delta", "text": text}
-        elif mode == "updates":
-            if "__interrupt__" in chunk:
-                payload = chunk["__interrupt__"][0].value
-                # 带上 conversation_id:中断时不发 done 帧,前端要靠这个才知道续跑用哪个会话。
-                # ch08:负载按中断类型透传(select_order 带 orders,confirm_ticket 带 preview),
-                # 前端按 kind 分发。
-                ev = {"type": "interrupt", "kind": payload.get("type", ""), "conversation_id": cid}
-                for k in ("orders", "preview"):
-                    if payload.get(k) is not None:
-                        ev[k] = payload[k]
-                yield ev
-                return
-            for node, upd in chunk.items():
-                if not isinstance(upd, dict):
+    events = get_graph().astream(stream_source, config, stream_mode=["messages", "updates"])
+    interrupt = None
+    async with aclosing(events):
+        async for mode, chunk in events:
+            if interrupt is not None:
+                continue
+            if mode == "messages":
+                msg, meta = chunk
+                if meta.get("langgraph_node") in ANSWER_NODES:
+                    text = msg.content if isinstance(msg.content, str) else ""
+                    if text:
+                        yield {"type": "delta", "text": text}
+            elif mode == "updates":
+                if "__interrupt__" in chunk:
+                    payload = chunk["__interrupt__"][0].value
+                    # 带上 conversation_id:中断时不发 done 帧,前端要靠这个才知道续跑用哪个会话。
+                    # ch08:负载按中断类型透传(select_order 带 orders,confirm_ticket 带 preview),
+                    # 前端按 kind 分发。
+                    ev = {"type": "interrupt", "kind": payload.get("type", ""), "conversation_id": cid}
+                    for k in ("orders", "preview"):
+                        if payload.get(k) is not None:
+                            ev[k] = payload[k]
+                    interrupt = ev
                     continue
-                if node in DETERMINISTIC_ANSWER_NODES and upd.get("answer"):
-                    event = {"type": "delta", "text": upd["answer"]}
-                    if node == "fallback_reply" and upd.get("trace", {}).get("service_failure"):
-                        event["replace"] = True
-                    yield event
-                if node in CITATION_NODES and upd.get("citations"):
-                    yield {"type": "citations", "items": upd["citations"]}
-                if node == "agent_tools":
-                    for m in upd.get("messages", []):
-                        name = getattr(m, "name", None)
-                        # submit_refund 仍是「拦成前端表单」的合成消息,不发工具帧;
-                        # create_ticket ch08 起确认后真执行,照常发帧
-                        if name and name != "submit_refund":
-                            yield {"type": "tool", "name": name}
-                if upd.get("suggested_actions"):
-                    actions.extend(upd["suggested_actions"])
+                for node, upd in chunk.items():
+                    if not isinstance(upd, dict):
+                        continue
+                    if node in DETERMINISTIC_ANSWER_NODES and upd.get("answer"):
+                        event = {"type": "delta", "text": upd["answer"]}
+                        if node == "fallback_reply" and upd.get("trace", {}).get("service_failure"):
+                            event["replace"] = True
+                        yield event
+                    if node in CITATION_NODES and upd.get("citations"):
+                        yield {"type": "citations", "items": upd["citations"]}
+                    if node == "agent_tools":
+                        for m in upd.get("messages", []):
+                            name = getattr(m, "name", None)
+                            # submit_refund 仍是「拦成前端表单」的合成消息,不发工具帧;
+                            # create_ticket ch08 起确认后真执行,照常发帧
+                            if name and name != "submit_refund":
+                                yield {"type": "tool", "name": name}
+                    if upd.get("suggested_actions"):
+                        actions.extend(upd["suggested_actions"])
+    if interrupt is not None:
+        yield interrupt
+        return
     if actions:
         yield {"type": "actions", "items": dedup_actions(actions)}
     yield {"type": "done", "conversation_id": cid}
@@ -205,8 +212,9 @@ async def stream_turn(user_id, message, conversation_id) -> AsyncIterator[dict]:
     """流式:落 user 消息 → astream 多模式 → 事件 dict(供 /api/chat 转 SSE)。"""
     cid, summary, upto = await _ensure_conversation(user_id, conversation_id)
     msg_id = await repository.append_message(cid, "user", content=message)
-    async for ev in _stream_events(cid, _graph_input(user_id, message, cid, msg_id, summary, upto)):
-        yield ev
+    async with aclosing(_stream_events(cid, _graph_input(user_id, message, cid, msg_id, summary, upto))) as stream:
+        async for ev in stream:
+            yield ev
     await summarizer.maybe_schedule_summary(cid)   # ch07 流吐完再触发(后台跑,不阻塞)
 
 
@@ -214,6 +222,7 @@ async def stream_resume(conversation_id: int, resume_value) -> AsyncIterator[dic
     """前端点选订单后续跑同一会话的暂停流(Command(resume) 续 astream,事件与 stream_turn 同构)。"""
     if await repository.get_conversation(conversation_id) is None:
         raise ConversationNotFound(conversation_id)
-    async for ev in _stream_events(conversation_id, Command(resume=resume_value)):
-        yield ev
+    async with aclosing(_stream_events(conversation_id, Command(resume=resume_value))) as stream:
+        async for ev in stream:
+            yield ev
     await summarizer.maybe_schedule_summary(conversation_id)

@@ -1156,7 +1156,10 @@
         card.addEventListener("click", async () => {
           wrap.querySelectorAll(".order-card").forEach((c) => (c.disabled = true));
           card.classList.add("picked");
-          await (onPick || pickThenResume)(o);
+          if (await (onPick || pickThenResume)(o) === false) {
+            card.classList.remove("picked");
+            wrap.querySelectorAll(".order-card").forEach((c) => (c.disabled = false));
+          }
         });
         wrap.appendChild(card);
       }
@@ -1166,7 +1169,8 @@
 
     // ch06:点完续跑图(有 interrupt 挂着)
     async function pickThenResume(o) {
-      addRow("user").textContent = "选择订单 " + o.order_id;
+      const selection = addRow("user");
+      selection.textContent = "选择订单 " + o.order_id;
       const nb = addRow("bot");
       setBusy(true);
       try {
@@ -1176,7 +1180,9 @@
         }));
       } catch (e) {
         nb.className = "bubble error";
-        nb.textContent = "续跑失败,请稍后重试";
+        nb.textContent = e.status === 409 ? e.message : "续跑失败,请稍后重试";
+        selection.parentElement.remove();
+        return false;
       } finally {
         setBusy(false);
       }
@@ -1209,7 +1215,8 @@
         btn.addEventListener("click", async () => {
           btns.querySelectorAll("button").forEach((b) => (b.disabled = true));
           card.classList.add("decided");
-          addRow("user").textContent = confirmed ? "确认提交工单" : "取消建单";
+          const selection = addRow("user");
+          selection.textContent = confirmed ? "确认提交工单" : "取消建单";
           const nb = addRow("bot");
           setBusy(true);
           try {
@@ -1220,7 +1227,9 @@
             }));
           } catch (e) {
             nb.className = "bubble error";
-            nb.textContent = "续跑失败,请稍后重试";
+            nb.textContent = e.status === 409 ? e.message : "续跑失败,请稍后重试";
+            selection.parentElement.remove();
+            card.classList.remove("decided");
             btns.querySelectorAll("button").forEach((b) => (b.disabled = false));
           } finally {
             setBusy(false);
@@ -1237,6 +1246,10 @@
 
     // 读一条 SSE 流,按帧分发到 on.{delta,tool,citations,actions,interrupt};done 存 conversation_id;event: error 抛错
     async function readSSEStream(resp, on) {
+      if (resp.status === 409) {
+        const {detail} = await resp.json();
+        throw Object.assign(new Error(detail), {status: 409});
+      }
       if (!resp.ok || !resp.body) throw new Error("bad response");
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
@@ -1322,11 +1335,13 @@
     }
 
     async function send(preset) {
+      if (sendBtn.disabled) return;
       const message = (preset ?? inputEl.value).trim();
       if (!message) return;
       inputEl.value = "";
       autoGrow();
-      addRow("user").textContent = message;
+      const draft = addRow("user");
+      draft.textContent = message;
       setBusy(true);
       const bubble = addRow("bot");
       try {
@@ -1336,7 +1351,14 @@
         }));
       } catch (err) {
         bubble.className = "bubble error";
-        bubble.textContent = "回复失败,请稍后重试";
+        if (err.status === 409) {
+          draft.parentElement.remove();
+          inputEl.value = message;
+          autoGrow();
+          bubble.textContent = err.message;
+        } else {
+          bubble.textContent = "回复失败,请稍后重试";
+        }
       } finally {
         setBusy(false);
         loadConversations();   // ch07:每轮后刷新侧栏(新会话入列/摘要标记更新)
