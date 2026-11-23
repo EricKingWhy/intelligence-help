@@ -4,7 +4,7 @@
 # 简历模版：jianli.xiaolinnote.com
 import logging
 from collections.abc import AsyncIterator
-from contextlib import aclosing
+from contextlib import aclosing, contextmanager, nullcontext
 
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -27,10 +27,27 @@ CITATION_NODES = {"retrieve_knowledge", "retrieve_policy"}
 
 _graph = None
 _cm = None  # AsyncSqliteSaver context manager,持有以免被 GC
+# ponytail: the SQLite checkpointer deployment runs one server worker.
+_active: set[int] = set()
 
 
 class ConversationNotFound(Exception):
     pass
+
+
+class ConversationBusy(Exception):
+    pass
+
+
+@contextmanager
+def hold_conversation(conversation_id: int):
+    if conversation_id in _active:
+        raise ConversationBusy("此会话正在处理另一条消息，请稍后重试")
+    _active.add(conversation_id)
+    try:
+        yield
+    finally:
+        _active.remove(conversation_id)
 
 
 async def init_graph() -> None:
@@ -128,13 +145,14 @@ def _interrupt_payload(state: dict):
 async def run_turn(user_id, message, conversation_id) -> dict:
     """非流式:落 user 消息 → ainvoke → 返回终态(供 /api/agent、eval)。遇 interrupt 带 orders。"""
     cid, summary, upto = await _ensure_conversation(user_id, conversation_id)
-    msg_id = await repository.append_message(cid, "user", content=message)
-    # ch09:langfuse_session_id 让同一会话多轮在 Langfuse 界面串成一组(未挂回调时无害)
-    config = {"configurable": {"thread_id": str(cid)},
-              "metadata": {"langfuse_session_id": str(cid)}}
-    final = await get_graph().ainvoke(
-        _graph_input(user_id, message, cid, msg_id, summary, upto), config)
-    await summarizer.maybe_schedule_summary(cid)   # ch07 轮后触发检查(后台跑,不阻塞返回)
+    # The HTTP request already owns an existing conversation. A new one has just received its ID.
+    with hold_conversation(cid) if conversation_id is None else nullcontext():
+        msg_id = await repository.append_message(cid, "user", content=message)
+        config = {"configurable": {"thread_id": str(cid)},
+                  "metadata": {"langfuse_session_id": str(cid)}}
+        final = await get_graph().ainvoke(
+            _graph_input(user_id, message, cid, msg_id, summary, upto), config)
+        await summarizer.maybe_schedule_summary(cid)
     return {"conversation_id": cid, "state": final, "interrupt": _interrupt_payload(final)}
 
 
@@ -211,11 +229,13 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
 async def stream_turn(user_id, message, conversation_id) -> AsyncIterator[dict]:
     """流式:落 user 消息 → astream 多模式 → 事件 dict(供 /api/chat 转 SSE)。"""
     cid, summary, upto = await _ensure_conversation(user_id, conversation_id)
-    msg_id = await repository.append_message(cid, "user", content=message)
-    async with aclosing(_stream_events(cid, _graph_input(user_id, message, cid, msg_id, summary, upto))) as stream:
-        async for ev in stream:
-            yield ev
-    await summarizer.maybe_schedule_summary(cid)   # ch07 流吐完再触发(后台跑,不阻塞)
+    with hold_conversation(cid) if conversation_id is None else nullcontext():
+        msg_id = await repository.append_message(cid, "user", content=message)
+        graph_input = _graph_input(user_id, message, cid, msg_id, summary, upto)
+        async with aclosing(_stream_events(cid, graph_input)) as stream:
+            async for ev in stream:
+                yield ev
+        await summarizer.maybe_schedule_summary(cid)
 
 
 async def stream_resume(conversation_id: int, resume_value) -> AsyncIterator[dict]:

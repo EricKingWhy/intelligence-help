@@ -38,6 +38,8 @@ async def run_agent(req: AgentExecution, principal: Principal) -> AgentResponse:
         req = req.model_copy(update={"user_id": principal[0]})
     try:
         out = await runtime.run_turn(req.user_id, req.message, req.conversation_id)
+    except runtime.ConversationBusy as error:
+        raise HTTPException(409, str(error)) from error
     except runtime.ConversationNotFound:
         raise HTTPException(status_code=404, detail="会话不存在")
     except SQLAlchemyError:

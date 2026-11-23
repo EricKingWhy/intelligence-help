@@ -6,13 +6,10 @@ from typing import Annotated
 from fastapi import Depends, HTTPException
 
 from app.api.auth import Principal, owned_conversation
+from app.graph.runtime import ConversationBusy, hold_conversation
 from app.schemas.actions import ResumeRequest
 from app.schemas.agent import AgentRequest
 from app.schemas.chat import ChatRequest
-
-# ponytail: the SQLite checkpointer deployment runs one server worker.
-_active: set[int] = set()
-
 
 @contextmanager
 def _exclusive(conversation_id: int | None):
@@ -20,13 +17,11 @@ def _exclusive(conversation_id: int | None):
         # The runtime allocates a distinct conversation for each first turn.
         yield
         return
-    if conversation_id in _active:
-        raise HTTPException(409, "此会话正在处理另一条消息，请稍后重试")
-    _active.add(conversation_id)
     try:
-        yield
-    finally:
-        _active.remove(conversation_id)
+        with hold_conversation(conversation_id):
+            yield
+    except ConversationBusy as error:
+        raise HTTPException(409, str(error)) from error
 
 
 async def _chat(req: ChatRequest, principal: Principal):

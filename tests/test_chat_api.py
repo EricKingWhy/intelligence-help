@@ -7,18 +7,23 @@ import json
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from app.graph import runtime
 from app.main import app
 
 
-async def test_conversation_excludes_overlapping_http_graph_operations(monkeypatch):
+@pytest.mark.parametrize("new_conversation", [False, True])
+async def test_conversation_excludes_overlapping_http_graph_operations(monkeypatch, new_conversation):
     started = asyncio.Event()
     finish = asyncio.Event()
     received = []
 
     async def get_conversation(cid):
         return SimpleNamespace(summary=None, summary_upto_msg_id=None)
+
+    async def create_conversation(user_id):
+        return 7
 
     async def append_message(cid, role, *, content):
         received.append((cid, content))
@@ -43,6 +48,7 @@ async def test_conversation_excludes_overlapping_http_graph_operations(monkeypat
                 yield "updates", {"script_reply": {"answer": "在路上"}}
 
     monkeypatch.setattr(runtime.repository, "get_conversation", get_conversation)
+    monkeypatch.setattr(runtime.repository, "create_conversation", create_conversation)
     monkeypatch.setattr(runtime.repository, "append_message", append_message)
     monkeypatch.setattr(runtime.summarizer, "maybe_schedule_summary", no_summary)
     monkeypatch.setattr(runtime, "get_graph", Graph)
@@ -50,7 +56,8 @@ async def test_conversation_excludes_overlapping_http_graph_operations(monkeypat
     async with _client() as client:
         message = {"user_id": "u1", "conversation_id": 7, "message": "查询订单"}
         resume = {"conversation_id": 7, "order_id": "1001"}
-        first = asyncio.create_task(client.post("/api/chat", json=message))
+        first_body = {**message, "conversation_id": None} if new_conversation else message
+        first = asyncio.create_task(client.post("/api/chat", json=first_body))
         try:
             await asyncio.wait_for(started.wait(), timeout=3)
             for path, body in (

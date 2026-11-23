@@ -50,6 +50,10 @@ async def chat(req: ChatExecution, principal: Principal):
                         yield _sse({"event": "actions", "items": ev["items"]})
                     elif ev["type"] == "done":
                         yield _sse({"event": "done", "conversation_id": ev["conversation_id"]})
+        except runtime.ConversationBusy as error:
+            for f in _sse_error(str(error)):
+                yield f
+            return
         except runtime.ConversationNotFound:
             for f in _sse_error("会话不存在"):
                 yield f
