@@ -75,23 +75,6 @@ def get_graph():
     return _graph
 
 
-async def get_turn_snapshot(conversation_id: int) -> dict:
-    """👎 快照尽力回捞(ch09):读该会话 checkpointer 终态,返回最近一轮的用户问题与召回快照。
-    调用方拿去比对被踩的 question,对得上才用快照——踩历史消息时快照可能已是别轮的,不硬塞。"""
-    config = {"configurable": {"thread_id": str(conversation_id)}}
-    st = await get_graph().aget_state(config)
-    values = getattr(st, "values", None) or {}
-    question = ""
-    for m in reversed(values.get("messages", [])):
-        if getattr(m, "type", "") == "human":
-            question = m.content if isinstance(m.content, str) else ""
-            break
-    snapshot = {"question": question, "snapshot": values.get("retrieved_snapshot") or []}
-    if values.get("service_failure"):
-        snapshot["service_failure"] = values["service_failure"]
-    return snapshot
-
-
 def dedup_actions(actions: list) -> list:
     """跨多个 ReAct 轮次累积的 suggested_actions 可能重复(如 agent 多次提议
     create_ticket);按 type 去重,保留每种 type 首次出现的那条。"""
@@ -123,7 +106,7 @@ def _graph_input(user_id: str, message: str, cid: int, msg_id: int,
     # messages 有 add_messages reducer(追加=跨轮历史),不清;steps/tokens_used 是本轮预算。
     # ch07:用户消息带 db-{msg_id} 锚点(滑窗与摘要边界对齐);summary 两字段每轮从库刷新。
     return {"messages": [HumanMessage(message, id=f"db-{msg_id}")], "user_id": user_id,
-            "conversation_id": cid, "steps": 0, "tokens_used": 0,
+            "conversation_id": cid, "reply_message_id": None, "steps": 0, "tokens_used": 0,
             "answer": "", "suggested_actions": [], "evidence": "",
             "evidence_strong": False, "citations": [],
             "evidence_confidence": 0.0, "fallback_source": "", "retrieved_snapshot": [], "service_failure": None,
@@ -179,6 +162,7 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
     config = {"configurable": {"thread_id": str(cid)},
               "metadata": {"langfuse_session_id": str(cid)}}
     actions: list = []
+    reply_message_id = None
     events = get_graph().astream(stream_source, config, stream_mode=["messages", "updates"])
     interrupt = None
     async with aclosing(events):
@@ -206,6 +190,8 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
                 for node, upd in chunk.items():
                     if not isinstance(upd, dict):
                         continue
+                    if node == "log":
+                        reply_message_id = upd.get("reply_message_id")
                     if node in DETERMINISTIC_ANSWER_NODES and upd.get("answer"):
                         event = {"type": "delta", "text": upd["answer"]}
                         if node == "fallback_reply" and upd.get("trace", {}).get("service_failure"):
@@ -227,7 +213,10 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
         return
     if actions:
         yield {"type": "actions", "items": dedup_actions(actions)}
-    yield {"type": "done", "conversation_id": cid}
+    done = {"type": "done", "conversation_id": cid}
+    if reply_message_id is not None:
+        done["message_id"] = reply_message_id
+    yield done
 
 
 async def stream_turn(user_id, message, conversation_id) -> AsyncIterator[dict]:

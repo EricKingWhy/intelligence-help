@@ -49,7 +49,9 @@ async def append_message(
     content: str | None = None,
     tool_calls: list | None = None,
     tool_call_id: str | None = None,
-    *, handoff: tuple[int, dict] | None = None,
+    *,
+    handoff: tuple[int, dict] | None = None,
+    reply_context: dict | None = None,
 ) -> int:
     async with db.async_session() as s:
         msg = Message(
@@ -58,18 +60,26 @@ async def append_message(
             content=content,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
+            handoff_context=reply_context,
         )
         s.add(msg)
         if handoff is not None:
             message_id, context = handoff
-            if context.get("service_failure"):
-                msg.handoff_context = {"service_failure": context["service_failure"]}
             await s.execute(update(Message).where(
                 Message.id == message_id, Message.conversation_id == conversation_id,
                 Message.role == "user", Message.handoff_context.is_(None),
             ).values(handoff_context=context))
         await s.commit()
         return msg.id
+
+
+async def get_feedback_reply(conversation_id: int, message_id: int) -> Message | None:
+    async with db.async_session() as s:
+        return await s.scalar(select(Message).where(
+            Message.id == message_id,
+            Message.conversation_id == conversation_id,
+            Message.role == "assistant",
+        ))
 
 
 async def list_messages(conversation_id: int) -> list[Message]:

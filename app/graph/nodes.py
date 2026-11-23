@@ -512,6 +512,10 @@ async def log_node(state) -> dict:
                       if action.get("type") == "transfer_human" and action.get("message_id")), None)
         evidence = state.get("retrieved_snapshot") or []
         message_id = transfer_action(state).get("message_id")
+        reply_context = {"feedback": {"question": _user_text(state), "evidence": evidence}}
+        if service_failure := state.get("service_failure"):
+            reply_context["service_failure"] = service_failure
+        handoff = None
         if message_id and (offer or evidence):
             user_id = state.get("user_id", "")
             question = _user_text(state)
@@ -531,12 +535,14 @@ async def log_node(state) -> dict:
                              if row["order_id"] == order_id)
             context = {"offered": bool(offer), "question": question[:4000],
                        "order": order, "evidence": evidence}
-            if service_failure := state.get("service_failure"):
+            if service_failure:
                 context["service_failure"] = service_failure
                 context["retryable"] = any(action.get("type") == "retry_turn"
                                            for action in state.get("suggested_actions", []))
-            await repository.append_message(state["conversation_id"], "assistant",
-                                            content=answer or None, handoff=(message_id, context))
-        else:
-            await repository.append_message(state["conversation_id"], "assistant", content=answer or None)
+            handoff = (message_id, context)
+        reply_id = await repository.append_message(
+            state["conversation_id"], "assistant", content=answer or None,
+            handoff=handoff, reply_context=reply_context,
+        )
+        return {"reply_message_id": reply_id}
     return {}

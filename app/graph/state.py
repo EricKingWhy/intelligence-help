@@ -20,6 +20,7 @@ def merge_dict(a: dict | None, b: dict | None) -> dict:
 
 
 class ConversationState(TypedDict, total=False):
+    reply_message_id: int | None
     messages: Annotated[list[AnyMessage], add_messages]  # 跨轮历史,checkpointer 续接
     summary: str            # ch07 早期轮次滚动摘要(入口每轮从 conversations 加载)
     summary_upto_msg_id: int  # 摘要覆盖到的 MySQL 消息 id,滑窗从其后接原文

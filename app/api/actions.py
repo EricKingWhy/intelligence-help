@@ -140,7 +140,7 @@ async def resume_action(req: ResumeExecution, principal: Principal):
                         yield _sse({"event": "interrupt",
                                     **{k: v for k, v in ev.items() if k != "type"}})
                     elif ev["type"] == "done":
-                        yield _sse({"event": "done", "conversation_id": ev["conversation_id"]})
+                        yield _sse({"event": "done", **{k: v for k, v in ev.items() if k != "type"}})
         except runtime.ConversationNotFound:
             yield "event: error\n"
             yield _sse({"message": "会话不存在"})
