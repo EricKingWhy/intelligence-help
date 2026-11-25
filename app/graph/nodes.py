@@ -409,6 +409,7 @@ async def agent_tools(state) -> dict:
     tool_msgs = []
     actions = list(state.get("suggested_actions", []))
     not_owned = False        # 这一轮有没有人报了不属于自己的订单号
+    service_failure = None
     for tc in last.tool_calls:
         name = tc["name"]
         args = tc.get("args") or {}
@@ -461,6 +462,7 @@ async def agent_tools(state) -> dict:
         else:
             # 含参数缺失的 create_ticket(decision is None):引擎校验拦下,错误说明回灌
             run = await engine.execute_tool_call(tc, cid, specs, user_id=uid)
+            service_failure = service_failure or run.service_failure
             if tc["name"] == "query_order" and not business.owns_order(
                     uid, str((tc.get("args") or {}).get("order_id") or "")):
                 not_owned = True
@@ -469,6 +471,8 @@ async def agent_tools(state) -> dict:
     if not_owned:
         actions.append({"type": "select_order", "orders": business.list_user_orders(uid)})
     out = {"messages": tool_msgs}
+    if service_failure:
+        out["service_failure"] = service_failure
     if actions:
         out["suggested_actions"] = actions
     return out

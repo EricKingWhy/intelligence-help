@@ -2,12 +2,13 @@ import json
 
 import httpx
 import pytest
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 from pymilvus.exceptions import MilvusException
 from sqlalchemy import func, select
 
-from app.db.models import LowConfidenceQuestion, Message
+from app.db.models import LowConfidenceQuestion, Message, ToolAuditLog
 from app.graph import nodes, runtime
 from app.graph.build import build_graph
 from app.main import app
@@ -20,6 +21,7 @@ from app.main import app
         ("timeout", "超时", {"stage": "generation", "kind": "timeout"}),
         ("milvus", "知识库暂时无法查询", {"stage": "knowledge_retrieval", "kind": "knowledge_unavailable"}),
         ("check", "超时", {"stage": "evidence_check", "kind": "timeout"}),
+        ("faq_check", "超时", {"stage": "evidence_check", "kind": "timeout"}),
     ],
 )
 async def test_service_failure_recovers_without_polluting_knowledge_queue(
@@ -29,7 +31,7 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
         return query
 
     async def classify(query, history):
-        return {"intent": "物流" if scenario == "timeout" else "商品咨询", "confidence": 0.95}
+        return {"intent": "物流" if scenario in {"timeout", "faq_check"} else "商品咨询", "confidence": 0.95}
 
     async def reject_model(_):
         response = httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"))
@@ -38,11 +40,20 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
     async def timeout(_):
         raise TimeoutError()
 
+    model_calls = 0
+
     class Model:
         def bind_tools(self, tools):
             return self
 
         async def ainvoke(self, messages, config):
+            nonlocal model_calls
+            model_calls += 1
+            if scenario == "faq_check":
+                assert model_calls == 1, "FAQ service failures should bypass further model calls"
+                return AIMessage(content="我先查一下", tool_calls=[
+                    {"name": "query_faq", "id": "faq", "args": {"keyword": "猫砂盆保修多久"}},
+                ])
             raise TimeoutError()
 
     async def hits(query, **kwargs):
@@ -55,7 +66,7 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
         return {"standard": query, "expanded": []}
 
     async def tool_specs():
-        return []
+        return [nodes.registry.get_builtin_spec("query_faq")] if scenario == "faq_check" else []
 
     monkeypatch.setattr(nodes.coref, "resolve", same_question)
     if scenario == "limit":
@@ -96,6 +107,12 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
             assert message.handoff_context["service_failure"] == diagnosis
             reply = await session.get(Message, done["message_id"])
             assert reply.handoff_context["service_failure"] == diagnosis
+            if scenario == "faq_check":
+                audit = (await session.scalars(select(ToolAuditLog))).one()
+                assert audit.tool_name == "query_faq"
+                assert audit.status == "超时"
+                assert audit.error_message == "evidence_check:timeout"
+                assert audit.retry_count == 0
         messages = await client.get(f"/api/conversations/{cid}/messages")
         assert messages.json()["items"][-1]["service_failed"] is True
 

@@ -42,6 +42,9 @@ async def query_faq(keyword: str, category: str | None = None) -> dict:
     # 语义闸:生成前自评证据够不够
     ev_texts = [f"{h['question']} {h['answer']}" for h in hits]
     chk = await selfcheck.check_sufficient(query, ev_texts)
+    if service_failure := chk.get("service_failure"):
+        return {"sufficient": False, "service_failure": service_failure,
+                "reason": chk["reason"], "citations": []}
     if not chk["useful"]:
         return {"sufficient": False, "source": "self_check",
                 "reason": chk["reason"], "citations": []}

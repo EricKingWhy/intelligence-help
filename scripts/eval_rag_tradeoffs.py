@@ -50,8 +50,8 @@ async def evaluate_one(strategy, sample, prepared, model, coverage, faith):
     check = await selfcheck.check_sufficient(
         query, [f"{hit['question']} {hit['answer']}" for hit in hits],
     ) if hits else {"useful": False}
-    if check.get("reason") == "证据自评失败":
-        raise RuntimeError("证据自评失败")
+    if service_failure := check.get("service_failure"):
+        raise RuntimeError(f"证据自评失败 ({service_failure['stage']}:{service_failure['kind']})")
     refused = not check["useful"]
     result = {
         "recall_at_5": _recall_at(ranks, 5) if ranks else None,
