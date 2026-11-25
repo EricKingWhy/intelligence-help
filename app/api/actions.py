@@ -2,7 +2,6 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
-import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import aclosing
@@ -15,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.api.auth import Principal, owned_conversation
 from app.api.conversation_execution import ResumeExecution
 from app.db import repository
+from app.api.reply_stream import error_frame, stream_frames
 from app.graph import runtime
 from app.tools.business import owns_order
 from app.schemas.actions import (
@@ -28,10 +28,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 SubmissionKey = Annotated[str | None, Header(alias="Idempotency-Key", min_length=1,
                                               max_length=128, pattern=r"^[a-zA-Z0-9_.:-]+$")]
-
-
-def _sse(payload: dict) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 @router.post("/api/actions/create-ticket", response_model=CreateTicketResponse)
@@ -88,11 +84,10 @@ async def resume_action(req: ResumeExecution, principal: Principal):
         ticket = await repository.get_ticket_result(req.conversation_id, f"agent:{req.confirmation_id}")
         if ticket:
             async def replay():
-                yield _sse({"delta": f"工单已创建:{ticket}"})
-                yield _sse({"event": "done", "conversation_id": req.conversation_id})
-                yield "data: [DONE]\n\n"
+                yield {"type": "delta", "text": f"工单已创建:{ticket}"}
+                yield {"type": "done", "conversation_id": req.conversation_id}
 
-            return StreamingResponse(replay(), media_type="text/event-stream")
+            return StreamingResponse(stream_frames(replay()), media_type="text/event-stream")
     if req.order_id is not None or principal is not None or req.confirmation_id:
         state = await runtime.get_graph().aget_state(
             {"configurable": {"thread_id": str(req.conversation_id)}},
@@ -127,29 +122,12 @@ async def resume_action(req: ResumeExecution, principal: Principal):
     async def event_stream() -> AsyncIterator[str]:
         try:
             async with aclosing(runtime.stream_resume(req.conversation_id, resume_value)) as stream:
-                async for ev in stream:
-                    if ev["type"] == "tool":
-                        yield _sse({"event": "tool", "name": ev["name"]})
-                    elif ev["type"] == "delta":
-                        yield _sse({"delta": ev["text"], **({"replace": True} if ev.get("replace") else {})})
-                    elif ev["type"] == "citations":
-                        yield _sse({"event": "citations", "items": ev["items"]})
-                    elif ev["type"] == "actions":
-                        yield _sse({"event": "actions", "items": ev["items"]})
-                    elif ev["type"] == "interrupt":
-                        yield _sse({"event": "interrupt",
-                                    **{k: v for k, v in ev.items() if k != "type"}})
-                    elif ev["type"] == "done":
-                        yield _sse({"event": "done", **{k: v for k, v in ev.items() if k != "type"}})
+                async for frame in stream_frames(stream):
+                    yield frame
         except runtime.ConversationNotFound:
-            yield "event: error\n"
-            yield _sse({"message": "会话不存在"})
-            return
+            yield error_frame("会话不存在")
         except Exception:
             logger.exception("续跑失败 conv=%s", req.conversation_id)
-            yield "event: error\n"
-            yield _sse({"message": "上游暂时不可用,请稍后重试"})
-            return
-        yield "data: [DONE]\n\n"
+            yield error_frame("上游暂时不可用,请稍后重试")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

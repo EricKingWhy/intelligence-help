@@ -106,7 +106,7 @@ def _graph_input(user_id: str, message: str, cid: int, msg_id: int,
     # messages 有 add_messages reducer(追加=跨轮历史),不清;steps/tokens_used 是本轮预算。
     # ch07:用户消息带 db-{msg_id} 锚点(滑窗与摘要边界对齐);summary 两字段每轮从库刷新。
     return {"messages": [HumanMessage(message, id=f"db-{msg_id}")], "user_id": user_id,
-            "conversation_id": cid, "reply_message_id": None, "steps": 0, "tokens_used": 0,
+            "conversation_id": cid, "reply_message_id": None, "reply_text": None, "steps": 0, "tokens_used": 0,
             "answer": "", "suggested_actions": [], "evidence": "",
             "evidence_strong": False, "citations": [],
             "evidence_confidence": 0.0, "fallback_source": "", "retrieved_snapshot": [], "service_failure": None,
@@ -163,6 +163,7 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
               "metadata": {"langfuse_session_id": str(cid)}}
     actions: list = []
     reply_message_id = None
+    reply_text = None
     events = get_graph().astream(stream_source, config, stream_mode=["messages", "updates"])
     interrupt = None
     async with aclosing(events):
@@ -192,6 +193,7 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
                         continue
                     if node == "log":
                         reply_message_id = upd.get("reply_message_id")
+                        reply_text = upd.get("reply_text")
                     if node in DETERMINISTIC_ANSWER_NODES and upd.get("answer"):
                         event = {"type": "delta", "text": upd["answer"]}
                         if node == "fallback_reply" and upd.get("trace", {}).get("service_failure"):
@@ -216,6 +218,8 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
     done = {"type": "done", "conversation_id": cid}
     if reply_message_id is not None:
         done["message_id"] = reply_message_id
+        if reply_text is not None:
+            done["final_text"] = reply_text
     yield done
 
 

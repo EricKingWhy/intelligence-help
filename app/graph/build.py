@@ -55,7 +55,11 @@ def _builder() -> StateGraph:
         "service_failure": "fallback_reply",
         "stop": "log",
     })
-    b.add_edge("agent_tools", "main_agent")
+    b.add_conditional_edges(
+        "agent_tools",
+        lambda state: "fallback_reply" if state.get("service_failure") else "main_agent",
+        ["fallback_reply", "main_agent"],
+    )
     # 确定性出口 → 日志 → END
     b.add_edge("complaint_reply", "log")
     b.add_edge("handoff_reply", "log")

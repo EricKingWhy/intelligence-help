@@ -52,6 +52,17 @@ def arrange_head_tail(items: list) -> list:
     return [items[0], *items[2:], items[1]]
 
 
+def format_evidence(hits: list[dict]) -> tuple[str, list[dict]]:
+    """Turn ranked hits into model evidence and its matching numbered citations."""
+    citations = [
+        {"n": i + 1, "id": h["id"], "section_path": h.get("section_path", ""),
+         "question": h["question"], "answer": h["answer"], "content_type": h.get("content_type", "")}
+        for i, h in enumerate(arrange_head_tail(hits))
+    ]
+    evidence = "\n".join(f"[{c['n']}] {c['question']}: {c['answer']}" for c in citations)
+    return evidence, citations
+
+
 async def search_knowledge(
     query: str, strategy: str = "hybrid_rerank", top_k: int | None = None,
     category: str | None = None, client=None, collection: str = "knowledge",

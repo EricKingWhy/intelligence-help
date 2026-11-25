@@ -37,6 +37,7 @@ class ToolRun:
     status: str               # 成功 / 失败 / 超时 / 校验拦下 / 权限拒绝
     retry_count: int = 0
     duration_ms: int = 0
+    service_failure: dict[str, str] | None = None
 
 
 def ticket_confirmation_id(scope: str, tool_call_id: str) -> str:
@@ -119,9 +120,11 @@ async def execute_tool_call(
     args = dict(tool_call.get("args") or {})
     started = time.monotonic()
 
-    def _run(ok: bool, content: str, status: str, retry_count: int = 0) -> ToolRun:
+    def _run(ok: bool, content: str, status: str, retry_count: int = 0, *,
+             service_failure: dict[str, str] | None = None) -> ToolRun:
         return ToolRun(tool_call_id=tc_id, name=name, ok=ok, status=status, retry_count=retry_count,
                        duration_ms=int((time.monotonic() - started) * 1000),
+                       service_failure=service_failure,
                        tool_message=ToolMessage(content=content, tool_call_id=tc_id,
                                                 name=name or "unknown",
                                                 status="success" if ok else "error"))
@@ -181,6 +184,15 @@ async def execute_tool_call(
         try:
             result = await asyncio.wait_for(spec.tool.ainvoke(args), timeout=tool_timeout)
             content = _format_content(spec, result)
+            # Only the built-in FAQ returns a trusted evidence-check diagnosis.
+            if name == "query_faq" and spec.source == "builtin" and isinstance(result, dict):
+                if service_failure := result.get("service_failure"):
+                    kind = service_failure["kind"]
+                    status = "超时" if kind == "timeout" else "失败"
+                    run = _run(False, content, status, attempt, service_failure=service_failure)
+                    await _audit(conversation_id, tc_id, name, spec, args, None,
+                                 status, f"{service_failure['stage']}:{kind}", attempt, run.duration_ms)
+                    return run
             run = _run(True, content, "成功", attempt)
             await _audit(conversation_id, tc_id, name, spec, args, _summarize(content),
                          "成功", None, attempt, run.duration_ms)

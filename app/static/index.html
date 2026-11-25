@@ -1176,7 +1176,7 @@
         }));
       } catch (e) {
         nb.className = "bubble error";
-        nb.textContent = e.status === 409 ? e.message : "续跑失败,请稍后重试";
+        nb.textContent = streamErrorText(e, "续跑失败,请稍后重试");
         selection.parentElement.remove();
         return false;
       } finally {
@@ -1223,7 +1223,8 @@
             }));
           } catch (e) {
             nb.className = "bubble error";
-            nb.textContent = e.status === 409 ? e.message : "续跑失败,请稍后重试";
+            const fallback = confirmed ? "工单提交结果未知，请先回看会话或核对原工单状态" : "续跑失败,请稍后重试";
+            nb.textContent = streamErrorText(e, fallback);
             selection.parentElement.remove();
             card.classList.remove("decided");
             btns.querySelectorAll("button").forEach((b) => (b.disabled = false));
@@ -1240,7 +1241,24 @@
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
-    // 读一条 SSE 流,按帧分发到 on.{delta,tool,citations,actions,interrupt};done 存 conversation_id;event: error 抛错
+    function incompleteReply() {
+      return Object.assign(new Error("回复接收中断，请先回看会话确认处理结果"), {incomplete: true});
+    }
+
+    function streamErrorText(error, fallback) {
+      return error.status === 409 || error.incomplete ? error.message : fallback;
+    }
+
+    function parseStreamFrame(payload) {
+      try {
+        const frame = JSON.parse(payload);
+        if (frame && typeof frame === "object" && !Array.isArray(frame)) return frame;
+      } catch (e) {
+        // A malformed frame can arrive after the assistant or tool has already saved a result.
+      }
+      throw incompleteReply();
+    }
+
     async function readSSEStream(resp, on) {
       if (resp.status === 409) {
         const {detail} = await resp.json();
@@ -1250,32 +1268,44 @@
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const frames = buffer.split("\n\n");
-        buffer = frames.pop() ?? "";
-        for (const frame of frames) {
-          if (frame.startsWith("event: error")) throw new Error("stream error");
-          const line = frame.split("\n").find((l) => l.startsWith("data: "));
-          if (!line) continue;
-          const payload = line.slice(6);
-          if (payload === "[DONE]") return;
-          const data = JSON.parse(payload);
-          if (data.event === "tool") on.tool && on.tool(data.name);
-          else if (data.event === "citations") on.citations && on.citations(data.items || []);
-          else if (data.event === "interrupt") {
-            if (data.conversation_id) setConversationId(data.conversation_id);  // 中断无 done 帧,靠这里记会话号供续跑
-            on.interrupt && on.interrupt(data);
+      let terminal;
+      try {
+        while (true) {
+          const {value, done} = await reader.read().catch(() => { throw incompleteReply(); });
+          if (done) throw incompleteReply();
+          buffer = (buffer + decoder.decode(value, {stream: true})).replace(/\r\n/g, "\n");
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+          for (const frame of frames) {
+            const line = frame.split("\n").find((part) => part.startsWith("data: "));
+            if (frame.startsWith("event: error")) {
+              const error = line ? parseStreamFrame(line.slice(6)) : {};
+              if (error.code === "incomplete_reply") throw incompleteReply();
+              throw new Error(error.message || "stream error");
+            }
+            if (!line) continue;
+            const payload = line.slice(6);
+            if (payload === "[DONE]") {
+              if (!terminal) throw incompleteReply();
+              return terminal;
+            }
+            if (terminal) throw incompleteReply();
+            const data = parseStreamFrame(payload);
+            if (data.event === "done" || data.event === "interrupt") {
+              if (!Number.isSafeInteger(data.conversation_id) || data.conversation_id <= 0 ||
+                  (data.event === "interrupt" && !["select_order", "confirm_ticket"].includes(data.kind))) {
+                throw incompleteReply();
+              }
+              terminal = data;
+            } else if (data.event === "tool") on.tool(data.name);
+            else if (data.event === "citations") on.citations(data.items || []);
+            else if (data.event === "actions") on.actions(data.items || []);
+            else if (data.delta !== undefined) on.delta(data.delta, data.replace);
           }
-          else if (data.event === "actions") on.actions && on.actions(data.items || []);
-          else if (data.event === "done") {
-            setConversationId(data.conversation_id);
-            on.done?.(data);
-          }
-          else if (data.delta !== undefined) on.delta && on.delta(data.delta, data.replace);
         }
+      } finally {
+        void reader.cancel().catch(() => {});
+        reader.releaseLock();
       }
     }
 
@@ -1284,9 +1314,8 @@
     // (确认提交/取消),两者都在用户操作后开新气泡续跑。
     async function streamInto(bubble, doFetch) {
       showTyping(bubble);
-      let structured = false, textStarted = false, interrupted = false, raw = "";
+      let structured = false, textStarted = false, raw = "";
       let badgesEl = null, textEl = null, citations = [], actions = [], serviceFailed = false;
-      let replyId;
       function ensureStructure() {
         if (structured) return;
         bubble.innerHTML = "";
@@ -1300,7 +1329,7 @@
         structured = true;
       }
       const resp = await doFetch();
-      await readSSEStream(resp, {
+      const terminal = await readSSEStream(resp, {
         delta: (delta, replace) => {
           ensureStructure();
           if (replace) { raw = ""; citations = []; serviceFailed = true; }
@@ -1319,23 +1348,27 @@
         },
         citations: (items) => { citations = items; },
         actions: (items) => { actions = items; },
-        done: (data) => { replyId = data.message_id; },
-        interrupt: (data) => {
-          interrupted = true;
-          if (!structured) { bubble.innerHTML = ""; structured = true; }
-          // ch08:中断按 kind 分发——select_order 弹订单卡,confirm_ticket 弹工单预览卡
-          if (data.kind === "confirm_ticket") renderTicketConfirm(bubble, data.preview || {});
-          else if (data.kind === "select_order") {
-            renderOrderCards(bubble, data.orders || [],
-              (order) => pickThenResume(order, data.conversation_id, data.interrupt_id));
-          }
-        },
       });
-      if (interrupted) return;
-      if (!textStarted) { ensureStructure(); textEl.innerHTML = ""; textEl.textContent = "(无回复)"; }
+      setConversationId(terminal.conversation_id);
+      if (terminal.event === "interrupt") {
+        if (!structured) bubble.innerHTML = "";
+        if (terminal.kind === "confirm_ticket") renderTicketConfirm(bubble, terminal.preview || {});
+        else {
+          renderOrderCards(bubble, terminal.orders || [],
+            (order) => pickThenResume(order, terminal.conversation_id, terminal.interrupt_id));
+        }
+        return;
+      }
+      if (typeof terminal.final_text === "string" && terminal.final_text !== raw) {
+        ensureStructure();
+        raw = terminal.final_text;
+        textStarted = Boolean(raw);
+        textEl.innerHTML = renderMarkdown(raw);
+      }
+      if (!textStarted) { ensureStructure(); textEl.textContent = "(无回复)"; }
       if (textStarted && citations.length) decorateCitations(textEl, citations);
       if (actions.length) renderActions(bubble, actions);
-      if (textStarted && !serviceFailed && replyId) addFeedbackBar(bubble, replyId);
+      if (textStarted && !serviceFailed && terminal.message_id) addFeedbackBar(bubble, terminal.message_id);
     }
 
     async function send(preset) {
@@ -1361,7 +1394,7 @@
           autoGrow();
           bubble.textContent = err.message;
         } else {
-          bubble.textContent = "回复失败,请稍后重试";
+          bubble.textContent = streamErrorText(err, "回复失败,请稍后重试");
         }
       } finally {
         setBusy(false);

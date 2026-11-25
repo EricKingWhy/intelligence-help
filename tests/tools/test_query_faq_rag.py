@@ -72,3 +72,48 @@ async def test_query_faq_self_check_fail(monkeypatch):
     out = await faq.query_faq.ainvoke({"keyword": "Pro型号能自动铲屎吗"})
     assert out["sufficient"] is False and out["source"] == "self_check"
     assert "型号" in out["reason"]
+
+@pytest.mark.asyncio
+async def test_numbered_evidence_matches_across_online_paths(monkeypatch):
+    from app.graph import nodes
+
+    ranked = [
+        {"id": i, "rerank_score": score, "question": f"问题{i}", "answer": f"答案{i}",
+         "section_path": f"章节{i}", "content_type": "policy"}
+        for i, score in [(1, 0.98), (2, 0.91), (3, 0.85), (4, 0.79)]
+    ]
+
+    del ranked[-1]["section_path"]
+    del ranked[-1]["content_type"]
+
+    async def understand(query):
+        return {"standard": query, "expanded": []}
+
+    async def expand(query):
+        return [query, "补充问法"]
+
+    async def search(query, **kwargs):
+        if query == "补充问法":
+            return [{**ranked[0], "rerank_score": 0.7, "answer": "同块较低分版本"}]
+        return ranked
+
+    async def sufficient(query, texts):
+        return {"useful": True, "reason": "够"}
+
+    monkeypatch.setattr(nodes.query_understanding, "understand", understand)
+    monkeypatch.setattr(nodes.query_understanding, "expand_queries", expand)
+    monkeypatch.setattr(nodes.retrieval, "search_knowledge", search)
+    monkeypatch.setattr(nodes.selfcheck, "check_sufficient", sufficient)
+
+    state = {"resolved_query": "退款政策"}
+    knowledge = await nodes.retrieve_knowledge(state)
+    refund = await nodes.retrieve_policy(state)
+    result = await faq.query_faq.ainvoke({"keyword": state["resolved_query"]})
+
+    assert knowledge["evidence_strong"] and result["sufficient"]
+    assert knowledge["citations"] == refund["citations"] == result["citations"]
+    assert [(item["n"], item["id"]) for item in result["citations"]] == [(1, 1), (2, 3), (3, 4), (4, 2)]
+    assert result["citations"][2]["section_path"] == result["citations"][2]["content_type"] == ""
+    assert knowledge["evidence"] == refund["evidence"] == result["evidence"]
+    assert result["evidence"].splitlines() == ["[1] 问题1: 答案1", "[2] 问题3: 答案3",
+                                              "[3] 问题4: 答案4", "[4] 问题2: 答案2"]

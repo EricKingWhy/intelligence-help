@@ -104,13 +104,7 @@ async def retrieve_policy(state) -> dict:
     except UPSTREAM_ERRORS as exc:
         return {"service_failure": failure(exc, "refund_retrieval")}
     ranked = sorted(merged.values(), key=lambda h: h["rerank_score"], reverse=True)
-    arranged = retrieval.arrange_head_tail(ranked)
-    citations = [
-        {"n": i + 1, "id": h["id"], "section_path": h["section_path"],
-         "question": h["question"], "answer": h["answer"], "content_type": h["content_type"]}
-        for i, h in enumerate(arranged)
-    ]
-    evidence = "\n".join(f"[{c['n']}] {c['question']}: {c['answer']}" for c in citations)
+    evidence, citations = retrieval.format_evidence(ranked)
     return {"evidence": evidence, "citations": citations,
             "trace": {"retrieve_policy": {"queries": queries, "hits": len(ranked)}}}
 
@@ -264,13 +258,7 @@ async def retrieve_knowledge(state) -> dict:
                 "trace": {"forced_rag": True, "evidence_confidence": conf.score,
                           "confidence_signals": conf.signals, "self_check": chk["reason"]}}
 
-    arranged = retrieval.arrange_head_tail(hits)
-    citations = [
-        {"n": i + 1, "id": h["id"], "section_path": h["section_path"],
-         "question": h["question"], "answer": h["answer"], "content_type": h["content_type"]}
-        for i, h in enumerate(arranged)
-    ]
-    evidence = "\n".join(f"[{c['n']}] {c['question']}: {c['answer']}" for c in citations)
+    evidence, citations = retrieval.format_evidence(hits)
     return {**base, "evidence_strong": True, "evidence": evidence, "citations": citations,
             "trace": {"forced_rag": True, "evidence_confidence": conf.score,
                       "confidence_signals": conf.signals}}
@@ -421,6 +409,7 @@ async def agent_tools(state) -> dict:
     tool_msgs = []
     actions = list(state.get("suggested_actions", []))
     not_owned = False        # 这一轮有没有人报了不属于自己的订单号
+    service_failure = None
     for tc in last.tool_calls:
         name = tc["name"]
         args = tc.get("args") or {}
@@ -473,6 +462,7 @@ async def agent_tools(state) -> dict:
         else:
             # 含参数缺失的 create_ticket(decision is None):引擎校验拦下,错误说明回灌
             run = await engine.execute_tool_call(tc, cid, specs, user_id=uid)
+            service_failure = service_failure or run.service_failure
             if tc["name"] == "query_order" and not business.owns_order(
                     uid, str((tc.get("args") or {}).get("order_id") or "")):
                 not_owned = True
@@ -481,6 +471,8 @@ async def agent_tools(state) -> dict:
     if not_owned:
         actions.append({"type": "select_order", "orders": business.list_user_orders(uid)})
     out = {"messages": tool_msgs}
+    if service_failure:
+        out["service_failure"] = service_failure
     if actions:
         out["suggested_actions"] = actions
     return out
@@ -548,5 +540,5 @@ async def log_node(state) -> dict:
             state["conversation_id"], "assistant", content=answer or None,
             handoff=handoff, reply_context=reply_context,
         )
-        return {"reply_message_id": reply_id}
+        return {"reply_message_id": reply_id, "reply_text": answer}
     return {}
