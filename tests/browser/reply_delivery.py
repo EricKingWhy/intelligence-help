@@ -56,10 +56,11 @@ async def check(browser, resume, body, expected, *, archived=False):
         await expect(send).to_be_enabled()
         bubble = page.locator(".row.bot").last
         await expect(bubble).to_contain_text(expected)
-        if "中断" in expected:
+        if "中断" in expected or "核对原工单状态" in expected:
             await expect(bubble.get_by_role("button", name="这条回答没帮助")).to_have_count(0)
         if archived:
             await expect(bubble.locator(".bubble-text")).to_have_text(expected)
+            await expect(bubble.locator("sup.cite")).to_have_attribute("title", "物流 / 发货")
             down = bubble.get_by_role("button", name="这条回答没帮助")
             await down.click()
             await expect(down).to_be_disabled()
@@ -84,22 +85,26 @@ async def main():
                     (wire(DELTA, DONE), "回复接收中断"),
                     (wire(DELTA) + "data: [DONE]\n\n", "回复接收中断"),
                     (wire(DELTA) + 'data: {"event":', "回复接收中断"),
+                    (wire(DELTA) + 'data: {"event":\n\n', "回复接收中断"),
+                    ('event: error\ndata: {"message":\n\n', "回复接收中断"),
                     (wire(PAUSE) + "data: [DONE]\n\n", "请确认工单信息"),
                     (wire(DELTA, DONE) + "data: [DONE]\n\n", DELTA["delta"]),
-                    ('event: error\ndata: {"message":"暂时不可用"}\n\n', "失败"),
+                    ('event: error\ndata: {"message":"暂时不可用"}\n\n',
+                     "核对原工单状态" if resume else "失败"),
                     ('event: error\ndata: {"code":"incomplete_reply"}\n\n', "回复接收中断"),
                 ]:
                     await check(browser, resume, body, expected)
-                answer = "订单已发货"
+                answer = "订单已发货[1]"
                 body = wire(
                     {"delta": "我先查一下"},
                     {"event": "tool", "name": "query_logistics"},
                     {"delta": "订单已"},
-                    {"delta": "发货"},
+                    {"delta": "发货[1]"},
+                    {"event": "citations", "items": [{"n": 1, "section_path": "物流 / 发货"}]},
                     {**DONE, "final_text": answer},
                 ) + "data: [DONE]\n\n"
                 await check(browser, resume, body, answer, archived=True)
-                print(f"Passed 9 stream cases (resume={resume})")
+                print(f"Passed 11 stream cases (resume={resume})")
         finally:
             await browser.close()
 

@@ -51,7 +51,7 @@ async def evaluate_one(strategy, sample, prepared, model, coverage, faith):
         query, [f"{hit['question']} {hit['answer']}" for hit in hits],
     ) if hits else {"useful": False}
     if service_failure := check.get("service_failure"):
-        raise RuntimeError(f"证据自评失败 ({service_failure['stage']}:{service_failure['kind']})")
+        return {"error": "EvidenceCheckFailure", "service_failure": service_failure}
     refused = not check["useful"]
     result = {
         "recall_at_5": _recall_at(ranks, 5) if ranks else None,
@@ -102,7 +102,9 @@ def summarize(rows):
     ok = [row for row in rows if "error" not in row]
     counts = {"n": len(rows), "failed": len(rows) - len(ok),
               "scoring_failed": sum("scoring_error" in row for row in ok),
-              "timeouts": sum(row.get("error") == "TimeoutError" for row in rows)}
+              "timeouts": sum(row.get("error") == "TimeoutError"
+                              or row.get("service_failure", {}).get("kind") == "timeout"
+                              for row in rows)}
     for key in ("recall_at_5", "mrr", "coverage", "faithfulness", "answer_calls", "answer_tokens",
                 "preprocessing_ms", "estimated_embedding_calls", "estimated_rerank_calls_upper_bound"):
         values = [row[key] for row in ok if row.get(key) is not None]

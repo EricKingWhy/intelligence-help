@@ -1223,7 +1223,8 @@
             }));
           } catch (e) {
             nb.className = "bubble error";
-            nb.textContent = streamErrorText(e, "续跑失败,请稍后重试");
+            const fallback = confirmed ? "工单提交结果未知，请先回看会话或核对原工单状态" : "续跑失败,请稍后重试";
+            nb.textContent = streamErrorText(e, fallback);
             selection.parentElement.remove();
             card.classList.remove("decided");
             btns.querySelectorAll("button").forEach((b) => (b.disabled = false));
@@ -1248,6 +1249,16 @@
       return error.status === 409 || error.incomplete ? error.message : fallback;
     }
 
+    function parseStreamFrame(payload) {
+      try {
+        const frame = JSON.parse(payload);
+        if (frame && typeof frame === "object" && !Array.isArray(frame)) return frame;
+      } catch (e) {
+        // A malformed frame can arrive after the assistant or tool has already saved a result.
+      }
+      throw incompleteReply();
+    }
+
     async function readSSEStream(resp, on) {
       if (resp.status === 409) {
         const {detail} = await resp.json();
@@ -1268,7 +1279,7 @@
           for (const frame of frames) {
             const line = frame.split("\n").find((part) => part.startsWith("data: "));
             if (frame.startsWith("event: error")) {
-              const error = line ? JSON.parse(line.slice(6)) : {};
+              const error = line ? parseStreamFrame(line.slice(6)) : {};
               if (error.code === "incomplete_reply") throw incompleteReply();
               throw new Error(error.message || "stream error");
             }
@@ -1279,7 +1290,7 @@
               return terminal;
             }
             if (terminal) throw incompleteReply();
-            const data = JSON.parse(payload);
+            const data = parseStreamFrame(payload);
             if (data.event === "done" || data.event === "interrupt") {
               if (!Number.isSafeInteger(data.conversation_id) || data.conversation_id <= 0 ||
                   (data.event === "interrupt" && !["select_order", "confirm_ticket"].includes(data.kind))) {

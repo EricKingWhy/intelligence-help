@@ -184,6 +184,7 @@ async def execute_tool_call(
         try:
             result = await asyncio.wait_for(spec.tool.ainvoke(args), timeout=tool_timeout)
             content = _format_content(spec, result)
+            # Only the built-in FAQ returns a trusted evidence-check diagnosis.
             if name == "query_faq" and spec.source == "builtin" and isinstance(result, dict):
                 if service_failure := result.get("service_failure"):
                     kind = service_failure["kind"]

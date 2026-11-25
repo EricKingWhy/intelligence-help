@@ -83,6 +83,9 @@ async def test_numbered_evidence_matches_across_online_paths(monkeypatch):
         for i, score in [(1, 0.98), (2, 0.91), (3, 0.85), (4, 0.79)]
     ]
 
+    del ranked[-1]["section_path"]
+    del ranked[-1]["content_type"]
+
     async def understand(query):
         return {"standard": query, "expanded": []}
 
@@ -110,6 +113,7 @@ async def test_numbered_evidence_matches_across_online_paths(monkeypatch):
     assert knowledge["evidence_strong"] and result["sufficient"]
     assert knowledge["citations"] == refund["citations"] == result["citations"]
     assert [(item["n"], item["id"]) for item in result["citations"]] == [(1, 1), (2, 3), (3, 4), (4, 2)]
+    assert result["citations"][2]["section_path"] == result["citations"][2]["content_type"] == ""
     assert knowledge["evidence"] == refund["evidence"] == result["evidence"]
     assert result["evidence"].splitlines() == ["[1] 问题1: 答案1", "[2] 问题3: 答案3",
                                               "[3] 问题4: 答案4", "[4] 问题2: 答案2"]
