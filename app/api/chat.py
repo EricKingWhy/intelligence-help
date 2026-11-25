@@ -2,7 +2,6 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
-import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import aclosing
@@ -13,19 +12,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.auth import Principal
 from app.api.conversation_execution import ChatExecution
+from app.api.reply_stream import error_frame, stream_frames
 from app.graph import runtime
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-
-def _sse(payload: dict) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _sse_error(message: str) -> AsyncIterator[str]:
-    yield "event: error\n"
-    yield _sse({"message": message})
 
 
 @router.post("/api/chat")
@@ -35,39 +26,17 @@ async def chat(req: ChatExecution, principal: Principal):
     async def event_stream() -> AsyncIterator[str]:
         try:
             async with aclosing(runtime.stream_turn(req.user_id, req.message, req.conversation_id)) as stream:
-                async for ev in stream:
-                    if ev["type"] == "tool":
-                        yield _sse({"event": "tool", "name": ev["name"]})
-                    elif ev["type"] == "delta":
-                        yield _sse({"delta": ev["text"], **({"replace": True} if ev.get("replace") else {})})
-                    elif ev["type"] == "citations":
-                        yield _sse({"event": "citations", "items": ev["items"]})
-                    elif ev["type"] == "interrupt":
-                        # ch08:负载透传(select_order 带 orders / confirm_ticket 带 preview),前端按 kind 分发
-                        yield _sse({"event": "interrupt",
-                                    **{k: v for k, v in ev.items() if k != "type"}})
-                    elif ev["type"] == "actions":
-                        yield _sse({"event": "actions", "items": ev["items"]})
-                    elif ev["type"] == "done":
-                        yield _sse({"event": "done", **{k: v for k, v in ev.items() if k != "type"}})
+                async for frame in stream_frames(stream):
+                    yield frame
         except runtime.ConversationBusy as error:
-            for f in _sse_error(str(error)):
-                yield f
-            return
+            yield error_frame(str(error))
         except runtime.ConversationNotFound:
-            for f in _sse_error("会话不存在"):
-                yield f
-            return
+            yield error_frame("会话不存在")
         except SQLAlchemyError:
             logger.exception("数据库错误 user_id=%s", req.user_id)
-            for f in _sse_error("数据库暂时不可用,请稍后重试"):
-                yield f
-            return
+            yield error_frame("数据库暂时不可用,请稍后重试")
         except Exception:
             logger.exception("图编排失败 user_id=%s", req.user_id)
-            for f in _sse_error("上游模型暂时不可用,请稍后重试"):
-                yield f
-            return
-        yield "data: [DONE]\n\n"
+            yield error_frame("上游模型暂时不可用,请稍后重试")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
