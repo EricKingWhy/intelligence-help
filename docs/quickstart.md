@@ -68,6 +68,12 @@ uv run python -m scripts.migrate_mysql --apply
 
 默认的 `demo` 模式兼容现有本机演示与课程脚本，仅用于本地测试。
 
+## Langfuse 观测
+
+配置 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 和 `LANGFUSE_BASE_URL` 后，应用会导出意图标签、时延、模型与 token 用量。导出省略客服正文、工具输入和结果，并关闭 trace 媒体上传。会话使用 `LANGFUSE_SECRET_KEY` 派生的 HMAC 标识，轮换密钥后新 trace 会使用新的标识。
+
+未配置或初始化失败时，聊天照常处理。遮蔽失败时，SDK 会丢弃该批次。更新只影响新导出，先前已保存的 trace 需要在 Langfuse 中按部署方的数据保留要求处理。
+
 ## 人工转接验收
 
 在聊天页输入“转人工”并确认，记录工单号。运营账户打开 `/handoffs`，展开该工单，核对本轮问题以及已有的订单和检索参考，接单后填写对客户可见的结论并结单。回到同一聊天会话，在“人工工单”里刷新并查看处理状态与结论。点击取消时不会创建工单，同一轮重复确认沿用原工单号。

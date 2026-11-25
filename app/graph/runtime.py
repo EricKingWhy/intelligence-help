@@ -12,7 +12,7 @@ from langgraph.types import Command
 
 from app.config import settings
 from app.core import summarizer
-from app.core.observability import attach_observability
+from app.core.observability import attach_observability, trace_metadata
 from app.db import repository
 from app.graph.build import build_graph
 
@@ -129,14 +129,20 @@ def _interrupt_payload(state: dict):
     return payload
 
 
+def _graph_config(conversation_id: int) -> dict:
+    return {
+        "configurable": {"thread_id": str(conversation_id)},
+        "metadata": trace_metadata(conversation_id),
+    }
+
+
 async def run_turn(user_id, message, conversation_id) -> dict:
     """非流式:落 user 消息 → ainvoke → 返回终态(供 /api/agent、eval)。遇 interrupt 带 orders。"""
     cid, summary, upto = await _ensure_conversation(user_id, conversation_id)
     # The HTTP request already owns an existing conversation. A new one has just received its ID.
     with hold_conversation(cid) if conversation_id is None else nullcontext():
         msg_id = await repository.append_message(cid, "user", content=message)
-        config = {"configurable": {"thread_id": str(cid)},
-                  "metadata": {"langfuse_session_id": str(cid)}}
+        config = _graph_config(cid)
         final = await get_graph().ainvoke(
             _graph_input(user_id, message, cid, msg_id, summary, upto), config)
         await summarizer.maybe_schedule_summary(cid)
@@ -147,8 +153,7 @@ async def resume_turn(conversation_id: int, resume_value) -> dict:
     """非流式续跑(供 /api/agent、eval):Command(resume) 回填后跑到下一个中断或结束。"""
     if await repository.get_conversation(conversation_id) is None:
         raise ConversationNotFound(conversation_id)
-    config = {"configurable": {"thread_id": str(conversation_id)},
-              "metadata": {"langfuse_session_id": str(conversation_id)}}
+    config = _graph_config(conversation_id)
     final = await get_graph().ainvoke(Command(resume=resume_value), config)
     await summarizer.maybe_schedule_summary(conversation_id)
     return {"conversation_id": conversation_id, "state": final,
@@ -159,8 +164,7 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
     """astream 多模式 → 事件 dict。stream_source 为 _graph_input(...)(新一轮)或 Command(resume=...)(续跑)。
     遇 interrupt(updates 块含 __interrupt__,Task 1 冒烟钉死)→ 吐 interrupt 事件并结束本次流
     (前端点选后走 /api/actions/resume 续流)。"""
-    config = {"configurable": {"thread_id": str(cid)},
-              "metadata": {"langfuse_session_id": str(cid)}}
+    config = _graph_config(cid)
     actions: list = []
     reply_message_id = None
     reply_text = None

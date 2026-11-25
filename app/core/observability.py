@@ -2,21 +2,76 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
-"""ch09 可观测:Langfuse 挂载与 trace 标注,全部可选降级。
+"""Export operational telemetry without conversation and tool content."""
+from __future__ import annotations
 
-课程 README 姿势:设三个环境变量 + 图编译时挂一次回调,节点业务代码零侵入。
-项目配置经 pydantic-settings(.env),不依赖 os.environ,故显式传参初始化单例。
-所有对外函数在未配置 Langfuse 时必须是安全 no-op——观测是增强,不是依赖。
-
-实装 SDK 为 langfuse 4.x:构造参 base_url(host 已弃用);给运行中的 trace 补
-metadata/tags 用 propagate_attributes 上下文管理器(v3 的 update_current_trace 已移除)。
-"""
+import hashlib
+import hmac
 import logging
+import os
+import re
+from typing import TYPE_CHECKING
 
 from app.config import settings
 
+if TYPE_CHECKING:
+    from langfuse.types import MaskOtelSpansParams, MaskOtelSpansResult
+    from opentelemetry.sdk.trace import ReadableSpan
+
 logger = logging.getLogger(__name__)
 _client = None
+
+
+_SESSION_ID = re.compile(r"mewhelp-[0-9a-f]{32}")
+# Permit only the SDK fields used to group traces and report cost, timing and status.
+_EXPORT_ATTRIBUTES = frozenset({
+    "langfuse.environment",
+    "langfuse.internal.as_root",
+    "langfuse.internal.is_app_root",
+    "langfuse.observation.completion_start_time",
+    "langfuse.observation.cost_details",
+    "langfuse.observation.level",
+    "langfuse.observation.model.name",
+    "langfuse.observation.type",
+    "langfuse.observation.usage_details",
+    "langfuse.trace.metadata.intent",
+    "langfuse.trace.metadata.intent_confidence",
+    "langfuse.trace.tags",
+})
+
+
+def _export_chat_span(span: ReadableSpan) -> bool:
+    # The SDK can patch attributes only. Exclude spans whose events, links or status
+    # descriptions may contain raw context, as well as other OTel instrumentation.
+    from langfuse.span_filter import is_langfuse_span
+
+    return is_langfuse_span(span) and not (span.events or span.links or span.status.description)
+
+
+def _mask_otel_spans(*, params: MaskOtelSpansParams) -> MaskOtelSpansResult:
+    from langfuse.types import MaskOtelSpansResult, OtelSpanPatch
+
+    patches = {}
+    for identifier, span in params.spans.items():
+        allowed = _EXPORT_ATTRIBUTES
+        session = span.attributes.get("session.id")
+        if isinstance(session, str) and _SESSION_ID.fullmatch(session):
+            allowed = allowed | {"session.id"}
+        patches[identifier] = OtelSpanPatch(
+            delete_attributes=tuple(key for key in span.attributes if key not in allowed),
+        )
+    return MaskOtelSpansResult(span_patches=patches)
+
+
+def trace_metadata(conversation_id: int) -> dict[str, str]:
+    if not langfuse_enabled():
+        return {}
+    digest = hmac.new(
+        settings.langfuse_secret_key.encode("utf-8"),
+        f"mewhelp:conversation:{conversation_id}".encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+    return {"langfuse_session_id": f"mewhelp-{digest}"}
 
 
 def langfuse_enabled() -> bool:
@@ -29,10 +84,15 @@ def _init_client():
     global _client
     if _client is None:
         from langfuse import Langfuse
+
+        # The SDK handles media before applying the span export mask.
+        os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
         _client = Langfuse(
             public_key=settings.langfuse_public_key,
             secret_key=settings.langfuse_secret_key,
             base_url=settings.langfuse_base_url,
+            should_export_span=_export_chat_span,
+            mask_otel_spans=_mask_otel_spans,
         )
     return _client
 
@@ -46,7 +106,7 @@ def _make_handler():
         span 上下文,tag_intent 的 propagate_attributes 写不进当前 trace(实测踩坑)。"""
         run_inline = True
 
-    return _InlineCallbackHandler()
+    return _InlineCallbackHandler(public_key=settings.langfuse_public_key)
 
 
 def get_langfuse():
@@ -61,17 +121,21 @@ def attach_observability(graph):
     未配置时原样返回——不挂、不 import langfuse。"""
     if not langfuse_enabled():
         return graph
-    _init_client()
-    return graph.with_config({"callbacks": [_make_handler()]})
+    try:
+        _init_client()
+        return graph.with_config({"callbacks": [_make_handler()]})
+    except Exception as exc:
+        logger.warning("Langfuse 初始化失败，已跳过追踪 (%s)", type(exc).__name__)
+        return graph
 
 
 def tag_intent(intent: str, confidence: float) -> None:
     """把意图写进当前 trace 的 metadata + tag(Cost Control 按意图分堆的钩子)。
     任何异常静默降级——观测失败不许影响业务流。"""
-    if not langfuse_enabled():
+    if not langfuse_enabled() or _client is None:
         return
     try:
-        from langfuse import get_client, propagate_attributes
+        from langfuse import propagate_attributes
         # 不能只 with...pass 写"当前活动 span"——LangGraph 异步调度下它可能已 ended,
         # OTel 对 ended span 的写入静默丢弃(实测踩坑)。改为在传播上下文内新建一个
         # event 观测:新 span 必然存活,trace 级属性(metadata/tags)随它上提到整条 trace。
@@ -79,6 +143,6 @@ def tag_intent(intent: str, confidence: float) -> None:
             metadata={"intent": intent, "intent_confidence": f"{confidence:.2f}"},
             tags=[f"intent:{intent}"],
         ):
-            get_client().create_event(name="intent-tagged")
-    except Exception:
-        logger.warning("langfuse tag_intent 失败(已忽略)", exc_info=True)
+            _client.create_event(name="intent-tagged")
+    except Exception as exc:
+        logger.warning("Langfuse 意图标记失败，已跳过 (%s)", type(exc).__name__)
