@@ -19,9 +19,10 @@ def wire(*frames):
     return "".join(f"data: {json.dumps(frame, ensure_ascii=False)}\n\n" for frame in frames)
 
 
-async def check(browser, resume, body, expected):
+async def check(browser, resume, body, expected, *, archived=False):
     page = await browser.new_page()
     requests = []
+    feedback = []
 
     async def respond(route):
         path = route.request.url.removeprefix(URL)
@@ -31,6 +32,16 @@ async def check(browser, resume, body, expected):
             requests.append(path)
             payload = wire(PAUSE) + "data: [DONE]\n\n" if resume and path == "/api/chat" else body
             await route.fulfill(body=payload, content_type="text/event-stream; charset=utf-8")
+        elif path.startswith("/api/conversations?") and archived:
+            await route.fulfill(json={"items": [{"id": 7, "preview": "测试"}]})
+        elif path == "/api/conversations/7/messages" and archived:
+            await route.fulfill(json={"items": [
+                {"id": 8, "role": "user", "content": "测试"},
+                {"id": 9, "role": "assistant", "content": expected},
+            ]})
+        elif path == "/api/feedback":
+            feedback.append(route.request.post_data_json)
+            await route.fulfill(json={"ok": True})
         else:
             await route.fulfill(json={"items": []})
 
@@ -47,6 +58,17 @@ async def check(browser, resume, body, expected):
         await expect(bubble).to_contain_text(expected)
         if "中断" in expected:
             await expect(bubble.get_by_role("button", name="这条回答没帮助")).to_have_count(0)
+        if archived:
+            await expect(bubble.locator(".bubble-text")).to_have_text(expected)
+            down = bubble.get_by_role("button", name="这条回答没帮助")
+            await down.click()
+            await expect(down).to_be_disabled()
+            await page.reload()
+            await page.locator(".conv-item").click()
+            await expect(bubble.locator(".bubble-text")).to_have_text(expected)
+            await down.click()
+            await expect(down).to_be_disabled()
+            assert [entry["message_id"] for entry in feedback] == [9, 9]
         assert requests == (["/api/chat", "/api/actions/resume"] if resume else ["/api/chat"])
     finally:
         await page.close()
@@ -68,7 +90,16 @@ async def main():
                     ('event: error\ndata: {"code":"incomplete_reply"}\n\n', "回复接收中断"),
                 ]:
                     await check(browser, resume, body, expected)
-                print(f"Passed 8 stream cases (resume={resume})")
+                answer = "订单已发货"
+                body = wire(
+                    {"delta": "我先查一下"},
+                    {"event": "tool", "name": "query_logistics"},
+                    {"delta": "订单已"},
+                    {"delta": "发货"},
+                    {**DONE, "final_text": answer},
+                ) + "data: [DONE]\n\n"
+                await check(browser, resume, body, answer, archived=True)
+                print(f"Passed 9 stream cases (resume={resume})")
         finally:
             await browser.close()
 

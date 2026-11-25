@@ -548,5 +548,5 @@ async def log_node(state) -> dict:
             state["conversation_id"], "assistant", content=answer or None,
             handoff=handoff, reply_context=reply_context,
         )
-        return {"reply_message_id": reply_id}
+        return {"reply_message_id": reply_id, "reply_text": answer}
     return {}

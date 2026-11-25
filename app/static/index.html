@@ -1348,7 +1348,13 @@
         }
         return;
       }
-      if (!textStarted) { ensureStructure(); textEl.innerHTML = ""; textEl.textContent = "(无回复)"; }
+      if (typeof terminal.final_text === "string" && terminal.final_text !== raw) {
+        ensureStructure();
+        raw = terminal.final_text;
+        textStarted = Boolean(raw);
+        textEl.innerHTML = renderMarkdown(raw);
+      }
+      if (!textStarted) { ensureStructure(); textEl.textContent = "(无回复)"; }
       if (textStarted && citations.length) decorateCitations(textEl, citations);
       if (actions.length) renderActions(bubble, actions);
       if (textStarted && !serviceFailed && terminal.message_id) addFeedbackBar(bubble, terminal.message_id);
