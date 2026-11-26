@@ -55,7 +55,7 @@ uv run python -m scripts.migrate_mysql --apply
 
 更新知识文件后执行 `make kb-repatch`，再用 `make kb-vectorize` 补齐 `pending`。若嵌入期间正文又被修改，该块会留待下一次向量化。发布时锁定当前知识块，Milvus 刷盘后才回标完成。
 
-此变更无需迁移。升级前先结束旧版本的向量化作业和补丁脚本。若存量块的 MySQL 正文和已发布索引不一致，暂停写入作业后按已核对的知识块 ID 将 MySQL 的 `vectorize_status` 恢复为 `pending`，再运行新版 `make kb-vectorize` 并检查实际检索结果。补跑沿用原知识块 ID。
+此变更无需迁移。升级前先结束旧版本的向量化作业和补丁脚本。发布期间 MySQL 连接失效时，应用会用新事务尝试将受影响的块恢复为 `pending`。若恢复也失败，可从报错日志核对块 ID。若存量块的 MySQL 正文和已发布索引不一致，暂停写入作业后按已核对的知识块 ID 将 MySQL 的 `vectorize_status` 恢复为 `pending`，再运行新版 `make kb-vectorize` 并检查实际检索结果。补跑沿用原知识块 ID。
 
 ## 真实用户部署
 

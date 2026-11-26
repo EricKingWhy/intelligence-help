@@ -1,7 +1,9 @@
 import asyncio
+from contextlib import asynccontextmanager
 from threading import Event
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from app.db import repository
 from app.kb import dualwrite, milvus_client
@@ -13,12 +15,12 @@ class RecordingIndex:
         self.rows = {}
         self.writes = []
 
-    def upsert(self, collection, rows):
+    def upsert(self, collection, rows, *, timeout=None):
         for row in rows:
             self.rows[row["id"]] = row
             self.writes.append(row["answer"])
 
-    def flush(self, collection):
+    def flush(self, collection, *, timeout=None):
         pass
 
 
@@ -38,7 +40,7 @@ async def test_edit_waits_for_in_flight_flush_and_preserves_pending(
     loop = asyncio.get_running_loop()
 
     class PausedIndex(RecordingIndex):
-        def flush(self, collection):
+        def flush(self, collection, *, timeout=None):
             loop.call_soon_threadsafe(in_flush.set)
             if not release_flush.wait(5):
                 raise RuntimeError("flush test barrier timed out")
@@ -74,3 +76,50 @@ async def test_edit_waits_for_in_flight_flush_and_preserves_pending(
     assert pending.answer == "新政策"
     assert await dualwrite.vectorize_pending(index, chunk_ids=[chunk_id]) == 1
     assert index.writes == ["旧政策", "新政策"]
+
+
+async def test_flush_timeout_keeps_chunk_pending(db_session_factory, monkeypatch):
+    chunk_id = await add_policy()
+
+    class SlowIndex(RecordingIndex):
+        def flush(self, collection, *, timeout=None):
+            assert timeout is not None and timeout > 0
+            raise TimeoutError("index flush deadline exceeded")
+
+    async def embed(texts):
+        return [[0.05]] * len(texts)
+
+    monkeypatch.setattr(dualwrite.embeddings, "embed_texts", embed)
+    monkeypatch.setattr(milvus_client, "ensure_collection", lambda *args, **kwargs: None)
+
+    with pytest.raises(TimeoutError, match="index flush deadline"):
+        await dualwrite.vectorize_pending(SlowIndex(), chunk_ids=[chunk_id])
+
+    assert [row.id for row in await repository.list_pending_chunks([chunk_id])] == [chunk_id]
+    assert await dualwrite.vectorize_pending(RecordingIndex(), chunk_ids=[chunk_id]) == 1
+
+
+async def test_uncertain_mysql_commit_requeues_the_published_batch(db_session_factory, monkeypatch):
+    chunk_id = await add_policy()
+    index = RecordingIndex()
+    lock_pending_chunks = repository.lock_pending_chunks
+
+    @asynccontextmanager
+    async def lose_commit_response(chunk_ids):
+        async with lock_pending_chunks(chunk_ids) as locked:
+            yield locked
+        raise OperationalError("COMMIT", {}, ConnectionError("connection lost"), connection_invalidated=True)
+
+    async def embed(texts):
+        return [[0.05]] * len(texts)
+
+    monkeypatch.setattr(dualwrite.embeddings, "embed_texts", embed)
+    monkeypatch.setattr(milvus_client, "ensure_collection", lambda *args, **kwargs: None)
+    with monkeypatch.context() as failed_commit:
+        failed_commit.setattr(repository, "lock_pending_chunks", lose_commit_response)
+        with pytest.raises(OperationalError):
+            await dualwrite.vectorize_pending(index, chunk_ids=[chunk_id])
+
+    assert index.rows[chunk_id]["answer"] == "旧政策"
+    assert [row.id for row in await repository.list_pending_chunks([chunk_id])] == [chunk_id]
+    assert await dualwrite.vectorize_pending(index, chunk_ids=[chunk_id]) == 1

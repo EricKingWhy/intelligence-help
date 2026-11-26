@@ -322,6 +322,16 @@ async def mark_chunk_vectorized(chunk_id: int, vector_id: str, *, session: Async
             row.vectorize_status = "done"
 
 
+async def requeue_vectorized_chunks(chunk_ids: list[int]) -> None:
+    """Rebuild affected vectors from the current text after an uncertain publication."""
+    async with db.async_session.begin() as session:
+        await session.execute(
+            update(KnowledgeChunk)
+            .where(KnowledgeChunk.id.in_(chunk_ids), KnowledgeChunk.vectorize_status == "done")
+            .values(vectorize_status="pending")
+        )
+
+
 async def set_chunk_neighbors(chunk_id: int, prev_id: int | None, next_id: int | None) -> None:
     async with db.async_session() as s:
         row = await s.get(KnowledgeChunk, chunk_id)

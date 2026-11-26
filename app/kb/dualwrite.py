@@ -2,10 +2,20 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
+import asyncio
+import logging
+from time import monotonic
+
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+
 from app.core import embeddings
 from app.db import repository
 from app.kb import milvus_client
 from app.kb.documents import Chunk
+
+
+logger = logging.getLogger(__name__)
+_PUBLICATION_TIMEOUT = 60.0
 
 
 async def write_pending(chunks: list[Chunk]) -> list[int]:
@@ -42,11 +52,47 @@ def _vector_fields(chunk) -> dict:
     }
 
 
-def _write_vectors(client, rows: list[dict], collection: str) -> None:
+def _prepare_index(client, collection: str):
     client = client or milvus_client.get_client()
     milvus_client.ensure_collection(client, collection=collection)
-    milvus_client.upsert_vectors(client, rows, collection=collection)
-    milvus_client.flush(client, collection=collection)
+    return client
+
+
+def _write_vectors(client, rows: list[dict], collection: str) -> None:
+    deadline = monotonic() + _PUBLICATION_TIMEOUT
+    milvus_client.upsert_vectors(client, rows, collection=collection, timeout=_PUBLICATION_TIMEOUT)
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Milvus publication deadline exceeded")
+    milvus_client.flush(client, collection=collection, timeout=remaining)
+
+
+async def _publish_current(client, snapshots: list[dict], vectors, collection: str) -> int:
+    rows = []
+    try:
+        async with repository.lock_pending_chunks([snapshot["id"] for snapshot in snapshots]) as (session, current):
+            for snapshot, vector in zip(snapshots, vectors, strict=True):
+                row = current.get(snapshot["id"])
+                if row is not None and snapshot == _vector_fields(row):
+                    rows.append({**snapshot, "dense": vector})
+            if not rows:
+                return 0
+
+            await asyncio.wait_for(
+                milvus_client.acall(_write_vectors, client, rows, collection, wait_on_cancel=True),
+                timeout=_PUBLICATION_TIMEOUT,
+            )
+            for row in rows:
+                await repository.mark_chunk_vectorized(row["id"], str(row["id"]), session=session)
+    except DBAPIError as exc:
+        if exc.connection_invalidated and rows:
+            chunk_ids = [row["id"] for row in rows]
+            try:
+                await repository.requeue_vectorized_chunks(chunk_ids)
+            except SQLAlchemyError:
+                logger.exception("MySQL disconnected during Milvus publication; requeue chunk IDs %s", chunk_ids)
+        raise
+    return len(rows)
 
 
 async def vectorize_pending(
@@ -59,23 +105,14 @@ async def vectorize_pending(
     pending = (await repository.list_pending_chunks() if chunk_ids is None
                else await repository.list_pending_chunks(chunk_ids))
     done = 0
+    index = None
     for batch in _batches(pending, batch_size):
         snapshots = [_vector_fields(chunk) for chunk in batch]
         vectors = await embeddings.embed_texts([snapshot["text"] for snapshot in snapshots])
         if len(vectors) != len(batch):
             raise ValueError(f"Expected {len(batch)} embeddings, received {len(vectors)}")
 
-        async with repository.lock_pending_chunks([chunk.id for chunk in batch]) as (session, current):
-            rows = []
-            for snapshot, vector in zip(snapshots, vectors):
-                row = current.get(snapshot["id"])
-                if row is not None and snapshot == _vector_fields(row):
-                    rows.append({**snapshot, "dense": vector})
-            if not rows:
-                continue
-
-            await milvus_client.acall(_write_vectors, client, rows, collection, wait_on_cancel=True)
-            for row in rows:
-                await repository.mark_chunk_vectorized(row["id"], str(row["id"]), session=session)
-        done += len(rows)
+        if index is None:
+            index = await milvus_client.acall(_prepare_index, client, collection)
+        done += await _publish_current(index, snapshots, vectors, collection)
     return done
