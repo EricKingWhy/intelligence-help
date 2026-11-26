@@ -45,3 +45,25 @@ def test_attach_wraps_with_callbacks_when_enabled(monkeypatch):
     monkeypatch.setattr(observability, "_make_handler", lambda: "HANDLER")
     assert observability.attach_observability(FakeGraph()) == "wrapped"
     assert calls["cfg"] == {"callbacks": ["HANDLER"]}
+
+
+def test_initialization_failure_leaves_graph_usable(monkeypatch, caplog):
+    import langfuse
+
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "langfuse_public_key", "pk-fixture")
+    monkeypatch.setattr(settings, "langfuse_secret_key", "secret-fixture")
+    monkeypatch.setattr(settings, "langfuse_base_url", "http://127.0.0.1:1")
+    monkeypatch.setattr(observability, "_client", None)
+    monkeypatch.setenv("LANGFUSE_MEDIA_UPLOAD_ENABLED", "true")
+
+    def failed_client(**kwargs):
+        raise RuntimeError("sensitive initialization context")
+
+    monkeypatch.setattr(langfuse, "Langfuse", failed_client)
+    graph = object()
+    assert observability.attach_observability(graph) is graph
+    observability.tag_intent("订单", 0.9)
+    assert "RuntimeError" in caplog.text
+    assert "sensitive initialization context" not in caplog.text
