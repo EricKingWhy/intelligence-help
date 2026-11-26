@@ -75,6 +75,69 @@ async def check(browser, resume, body, expected, *, archived=False):
         await page.close()
 
 
+async def check_pending_ticket(browser):
+    context = await browser.new_context()
+    pending = False
+    async def respond(route):
+        nonlocal pending
+        path = route.request.url.removeprefix(URL)
+        terminal = wire({"delta": "已继续"}, DONE) + "data: [DONE]\n\n"
+        if path == "/":
+            await route.fulfill(body=PAGE.read_text(encoding="utf-8"), content_type="text/html; charset=utf-8")
+        elif path == "/api/chat":
+            if route.request.post_data_json["message"] == "开工单":
+                pending = True
+                terminal = wire(PAUSE) + "data: [DONE]\n\n"
+            elif pending:
+                terminal = "event: error\n" + wire({
+                    "code": "ticket_confirmation_pending",
+                    "message": "此会话有待确认的工单，请先确认或取消",
+                    "preview": PAUSE["preview"],
+                })
+            await route.fulfill(body=terminal, content_type="text/event-stream; charset=utf-8")
+        elif path == "/api/actions/resume":
+            request = route.request.post_data_json
+            assert request["confirmation_id"] == PAUSE["preview"]["confirmation_id"]
+            if not pending:
+                await route.fulfill(status=409, json={"detail": "工单确认已失效"})
+                return
+            assert request["confirmed"] is False
+            pending = False
+            await route.fulfill(body=terminal, content_type="text/event-stream; charset=utf-8")
+        else:
+            await route.fulfill(json={"items": []})
+
+    await context.route(f"{URL}/**", respond)
+    try:
+        first = await context.new_page()
+        await first.goto(URL)
+        await first.locator("#input").fill("开工单")
+        await first.get_by_role("button", name="发送").click()
+        await expect(first.get_by_role("button", name="确认提交")).to_be_enabled()
+
+        other = await context.new_page()
+        await other.goto(URL)
+        await other.locator("#input").fill("稍后要发送的消息")
+        await other.get_by_role("button", name="发送").click()
+        await expect(other.locator("#input")).to_have_value("稍后要发送的消息")
+        await expect(other.locator(".ticket-confirm")).to_have_count(1)
+        await expect(other.locator(".row.user")).to_have_count(0)
+        await other.get_by_role("button", name="发送").click()
+        await expect(other.locator("#input")).to_have_value("稍后要发送的消息")
+        await expect(other.locator(".ticket-confirm")).to_have_count(1)
+
+        await other.get_by_role("button", name="取消", exact=True).click()
+        await expect(other.get_by_role("button", name="发送")).to_be_enabled()
+        await expect(other.locator("#input")).to_have_value("稍后要发送的消息")
+        await other.get_by_role("button", name="发送").click()
+        await expect(other.locator(".row.bot").last).to_contain_text("已继续")
+        await first.get_by_role("button", name="确认提交").click()
+        await expect(first.locator(".row.bot").last).to_contain_text("工单确认已失效")
+        print("Passed pending ticket recovery across tabs")
+    finally:
+        await context.close()
+
+
 async def main():
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(channel=os.getenv("PLAYWRIGHT_CHANNEL"))
@@ -105,6 +168,7 @@ async def main():
                 ) + "data: [DONE]\n\n"
                 await check(browser, resume, body, answer, archived=True)
                 print(f"Passed 11 stream cases (resume={resume})")
+            await check_pending_ticket(browser)
         finally:
             await browser.close()
 

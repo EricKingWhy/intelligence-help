@@ -8,10 +8,12 @@ def _data(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def error_frame(message: str, *, code: str | None = None) -> str:
-    payload = {"message": message}
+def error_frame(message: str, *, code: str | None = None, preview: dict | None = None) -> str:
+    payload: dict = {"message": message}
     if code is not None:
         payload["code"] = code
+    if preview is not None:
+        payload["preview"] = preview
     return "event: error\n" + _data(payload)
 
 

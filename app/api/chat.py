@@ -28,6 +28,8 @@ async def chat(req: ChatExecution, principal: Principal):
             async with aclosing(runtime.stream_turn(req.user_id, req.message, req.conversation_id)) as stream:
                 async for frame in stream_frames(stream):
                     yield frame
+        except runtime.PendingTicketConfirmation as error:
+            yield error_frame(str(error), code="ticket_confirmation_pending", preview=error.preview)
         except runtime.ConversationBusy as error:
             yield error_frame(str(error))
         except runtime.ConversationNotFound:

@@ -15,6 +15,7 @@ from app.core import summarizer
 from app.core.observability import attach_observability, trace_metadata
 from app.db import repository
 from app.graph.build import build_graph
+from app.tools.engine import ticket_confirmation_id
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,12 @@ class ConversationNotFound(Exception):
 
 class ConversationBusy(Exception):
     pass
+
+
+class PendingTicketConfirmation(Exception):
+    def __init__(self, preview: dict):
+        super().__init__("此会话有待确认的工单，请先确认或取消")
+        self.preview = preview
 
 
 @contextmanager
@@ -136,11 +143,37 @@ def _graph_config(conversation_id: int) -> dict:
     }
 
 
+def pending_ticket_preview(snapshot) -> dict | None:
+    for item in snapshot.interrupts:
+        if isinstance(item.value, dict) and item.value.get("type") == "confirm_ticket":
+            preview = dict(item.value.get("preview") or {})
+            if not preview.get("confirmation_id"):
+                messages = snapshot.values.get("messages", [])
+                if messages:
+                    last = messages[-1]
+                    # Older checkpoints captured the preview before it carried a confirmation ID.
+                    call = next((call for call in getattr(last, "tool_calls", [])
+                                 if call["name"] == "create_ticket"), None)
+                    if call is not None:
+                        preview["confirmation_id"] = ticket_confirmation_id(last.id or "", call["id"])
+            return preview
+    return None
+
+
+async def _check_pending_ticket(cid: int) -> None:
+    snapshot = await get_graph().aget_state(_graph_config(cid))
+    preview = pending_ticket_preview(snapshot)
+    if preview is not None:
+        raise PendingTicketConfirmation(preview)
+
+
 async def run_turn(user_id, message, conversation_id) -> dict:
     """非流式:落 user 消息 → ainvoke → 返回终态(供 /api/agent、eval)。遇 interrupt 带 orders。"""
     cid, summary, upto = await _ensure_conversation(user_id, conversation_id)
     # The HTTP request already owns an existing conversation. A new one has just received its ID.
     with hold_conversation(cid) if conversation_id is None else nullcontext():
+        if conversation_id is not None:
+            await _check_pending_ticket(cid)
         msg_id = await repository.append_message(cid, "user", content=message)
         config = _graph_config(cid)
         final = await get_graph().ainvoke(
@@ -231,6 +264,8 @@ async def stream_turn(user_id, message, conversation_id) -> AsyncIterator[dict]:
     """流式:落 user 消息 → astream 多模式 → 事件 dict(供 /api/chat 转 SSE)。"""
     cid, summary, upto = await _ensure_conversation(user_id, conversation_id)
     with hold_conversation(cid) if conversation_id is None else nullcontext():
+        if conversation_id is not None:
+            await _check_pending_ticket(cid)
         msg_id = await repository.append_message(cid, "user", content=message)
         graph_input = _graph_input(user_id, message, cid, msg_id, summary, upto)
         async with aclosing(_stream_events(cid, graph_input)) as stream:
