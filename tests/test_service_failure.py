@@ -66,6 +66,9 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
                     calls.insert(0, {"name": "create_ticket", "id": "create", "args": {
                         "ticket_type": "咨询", "description": "请帮我核对保修期",
                     }})
+                    calls.insert(1, {"name": "submit_refund", "id": "refund", "args": {
+                        "order_id": "1001", "reason": "质量问题",
+                    }})
                 return AIMessage(content="我先查一下", tool_calls=calls)
             raise TimeoutError()
 

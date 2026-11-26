@@ -234,6 +234,7 @@ async def _stream_events(cid: int, stream_source) -> AsyncIterator[dict]:
                     if node in DETERMINISTIC_ANSWER_NODES and upd.get("answer"):
                         event = {"type": "delta", "text": upd["answer"]}
                         if node == "fallback_reply" and upd.get("trace", {}).get("service_failure"):
+                            actions.clear()
                             event["replace"] = True
                         yield event
                     if node in CITATION_NODES and upd.get("citations"):
