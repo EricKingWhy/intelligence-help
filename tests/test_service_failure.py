@@ -1,4 +1,6 @@
+import asyncio
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -8,7 +10,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pymilvus.exceptions import MilvusException
 from sqlalchemy import func, select
 
-from app.db.models import LowConfidenceQuestion, Message, ToolAuditLog
+from app.db.models import LowConfidenceQuestion, Message, Ticket, ToolAuditLog
 from app.graph import nodes, runtime
 from app.graph.build import build_graph
 from app.main import app
@@ -22,22 +24,30 @@ from app.main import app
         ("milvus", "知识库暂时无法查询", {"stage": "knowledge_retrieval", "kind": "knowledge_unavailable"}),
         ("check", "超时", {"stage": "evidence_check", "kind": "timeout"}),
         ("faq_check", "超时", {"stage": "evidence_check", "kind": "timeout"}),
+        ("faq_deadline", "超时", {"stage": "faq_tool", "kind": "timeout"}),
+        ("faq_after_write", "确认原工单状态", {"stage": "faq_tool", "kind": "timeout"}),
     ],
 )
 async def test_service_failure_recovers_without_polluting_knowledge_queue(
     scenario, answer, diagnosis, db_session_factory, monkeypatch,
 ):
+    after_write = scenario == "faq_after_write"
+    faq_deadline = scenario in {"faq_deadline", "faq_after_write"}
+    uses_faq = scenario == "faq_check" or faq_deadline
+
     async def same_question(query, history):
         return query
 
     async def classify(query, history):
-        return {"intent": "物流" if scenario in {"timeout", "faq_check"} else "商品咨询", "confidence": 0.95}
+        return {"intent": "物流" if uses_faq or scenario == "timeout" else "商品咨询", "confidence": 0.95}
 
     async def reject_model(_):
         response = httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"))
         response.raise_for_status()
 
     async def timeout(_):
+        if faq_deadline:
+            await asyncio.Future()
         raise TimeoutError()
 
     model_calls = 0
@@ -49,11 +59,14 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
         async def ainvoke(self, messages, config):
             nonlocal model_calls
             model_calls += 1
-            if scenario == "faq_check":
+            if uses_faq:
                 assert model_calls == 1, "FAQ service failures should bypass further model calls"
-                return AIMessage(content="我先查一下", tool_calls=[
-                    {"name": "query_faq", "id": "faq", "args": {"keyword": "猫砂盆保修多久"}},
-                ])
+                calls = [{"name": "query_faq", "id": "faq", "args": {"keyword": "猫砂盆保修多久"}}]
+                if after_write:
+                    calls.insert(0, {"name": "create_ticket", "id": "create", "args": {
+                        "ticket_type": "咨询", "description": "请帮我核对保修期",
+                    }})
+                return AIMessage(content="我先查一下", tool_calls=calls)
             raise TimeoutError()
 
     async def hits(query, **kwargs):
@@ -66,7 +79,13 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
         return {"standard": query, "expanded": []}
 
     async def tool_specs():
-        return [nodes.registry.get_builtin_spec("query_faq")] if scenario == "faq_check" else []
+        if not uses_faq:
+            return []
+        faq = nodes.registry.get_builtin_spec("query_faq")
+        specs = [replace(faq, timeout=0.05)] if faq_deadline else [faq]
+        if after_write:
+            specs.append(nodes.registry.get_builtin_spec("create_ticket"))
+        return specs
 
     monkeypatch.setattr(nodes.coref, "resolve", same_question)
     if scenario == "limit":
@@ -90,10 +109,20 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
         response = await client.post("/api/chat", json={"user_id": "u1", "message": question})
         assert response.is_success
         events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+        if after_write:
+            pause = next(event for event in events if event.get("event") == "interrupt")
+            response = await client.post("/api/actions/resume", json={
+                "conversation_id": pause["conversation_id"], "confirmed": True,
+                "confirmation_id": pause["preview"]["confirmation_id"],
+            })
+            assert response.is_success
+            events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
         assert any(event.get("replace") and answer in event["delta"] for event in events)
         actions = next(event["items"] for event in events if event.get("event") == "actions")
-        assert [action["type"] for action in actions] == ["retry_turn", "transfer_human"]
-        assert actions[0]["draft"]["message"] == question
+        expected_actions = ["transfer_human"] if after_write else ["retry_turn", "transfer_human"]
+        assert [action["type"] for action in actions] == expected_actions
+        if not after_write:
+            assert actions[0]["draft"]["message"] == question
         done = next(event for event in events if event.get("event") == "done")
         cid = done["conversation_id"]
 
@@ -103,15 +132,18 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
         assert feedback.is_success and feedback.json()["pooled"] is False
         async with db_session_factory() as session:
             assert await session.scalar(select(func.count()).select_from(LowConfidenceQuestion)) == 0
-            message = await session.get(Message, actions[1]["message_id"])
+            message = await session.get(Message, actions[-1]["message_id"])
+            assert await session.scalar(select(func.count()).select_from(Ticket)) == int(after_write)
             assert message.handoff_context["service_failure"] == diagnosis
             reply = await session.get(Message, done["message_id"])
             assert reply.handoff_context["service_failure"] == diagnosis
-            if scenario == "faq_check":
-                audit = (await session.scalars(select(ToolAuditLog))).one()
+            if uses_faq:
+                audit = (await session.scalars(
+                    select(ToolAuditLog).where(ToolAuditLog.tool_name == "query_faq")
+                )).one()
                 assert audit.tool_name == "query_faq"
                 assert audit.status == "超时"
-                assert audit.error_message == "evidence_check:timeout"
+                assert audit.error_message == f"{diagnosis['stage']}:timeout"
                 assert audit.retry_count == 0
         messages = await client.get(f"/api/conversations/{cid}/messages")
         assert messages.json()["items"][-1]["service_failed"] is True
