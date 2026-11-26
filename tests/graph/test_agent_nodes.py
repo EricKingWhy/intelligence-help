@@ -133,3 +133,33 @@ async def test_退款不给别人的单开表单入口(monkeypatch, builtin_only
     assert "refund_form" not in types          # 没有退款入口
     assert "select_order" in types             # 但给了出路:列出他自己的单
     assert out["messages"][0].status == "error"
+
+
+async def test_main_agent_reads_complete_tool_groups_from_an_old_checkpoint(monkeypatch, builtin_only_specs):
+    from langchain_core.messages import ToolMessage
+
+    opener = HumanMessage("旧的用户问题")
+    orphan = AIMessage("等待确认", tool_calls=[
+        {"name": "query_order", "args": {"order_id": "1001"}, "id": "partial"},
+        {"name": "create_ticket", "args": {}, "id": "missing"},
+    ])
+    partial_reply = ToolMessage("旧结果", tool_call_id="partial")
+    completed = AIMessage("开始查询", tool_calls=[
+        {"name": "query_order", "args": {"order_id": "1001"}, "id": "good"},
+    ])
+    tool_reply = ToolMessage("订单结果", tool_call_id="good")
+    latest = HumanMessage("继续查一下")
+    history = [opener, orphan, partial_reply, completed, tool_reply, latest]
+
+    class CapturingModel:
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages, config=None):
+            assert messages[1:] == [opener, completed, tool_reply, latest]
+            return AIMessage("答复")
+
+    monkeypatch.setattr(nodes, "get_chat_model", lambda **kwargs: CapturingModel())
+    result = await nodes.main_agent({"messages": history})
+    assert result["messages"][0].content == "答复"
+    assert history == [opener, orphan, partial_reply, completed, tool_reply, latest]

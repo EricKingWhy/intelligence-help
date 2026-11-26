@@ -2,7 +2,9 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from collections import Counter
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 
 
@@ -62,6 +64,26 @@ def build_window(messages: list[BaseMessage], summary_upto_msg_id: int,
     window = messages[start:]
     trimmed = trim_history(window, max_tokens=max_tokens)
     return trimmed or window
+
+
+def complete_tool_history(window: list[BaseMessage]) -> list[BaseMessage]:
+    """Omit incomplete tool-call groups in legacy or trimmed model input."""
+    complete = []
+    index = 0
+    while index < len(window):
+        message = window[index]
+        end = index + 1
+        if isinstance(message, AIMessage) and message.tool_calls:
+            while end < len(window) and isinstance(window[end], ToolMessage):
+                end += 1
+            expected = Counter(call["id"] for call in message.tool_calls)
+            actual = Counter(tool.tool_call_id for tool in window[index + 1:end])
+            if expected == actual:
+                complete.extend(window[index:end])
+        elif not isinstance(message, ToolMessage):
+            complete.append(message)
+        index = end
+    return complete
 
 
 def summary_line(summary: str | None) -> str:

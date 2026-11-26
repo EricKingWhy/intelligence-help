@@ -327,6 +327,7 @@ def _agent_messages(state) -> list:
     window = memory.build_window(state.get("messages", []),
                                  state.get("summary_upto_msg_id") or 0,
                                  settings.context_window_max_tokens)
+    window = memory.complete_tool_history(window)
     turn_ctx = _turn_context(state)
     if turn_ctx:
         window = _with_turn_context(window, turn_ctx)
