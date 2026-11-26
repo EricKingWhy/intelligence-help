@@ -3,6 +3,11 @@
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
 """ch09 飞轮核心:标准化+查重一次输出;命中累加不新建、不复活;幻觉 id 跳过;串行防同批重复。"""
+import asyncio
+from unittest.mock import AsyncMock
+
+import pytest
+
 from app.core import flywheel
 from app.core.flywheel import NormalizeResult
 from app.db import repository
@@ -85,3 +90,54 @@ async def test_same_batch_duplicates_merge_serially(db_session_factory, monkeypa
     assert seen_candidates[0] == [] and len(seen_candidates[1]) == 1
     rows = await repository.list_review_queue(None)
     assert len(rows) == 1 and rows[0].occurrence_count == 2
+
+
+@pytest.mark.parametrize("existing_status", [None, "通过", "驳回"])
+async def test_candidate_and_source_roll_back_together(db_session_factory, monkeypatch, existing_status):
+    review_id = None
+    if existing_status:
+        review_id = await repository.insert_review_item("猫窝能否清洗", None)
+        await repository.update_review_status(review_id, existing_status)
+    await repository.insert_low_confidence(None, "猫窝怎么洗", "self_check", None)
+    result = NormalizeResult(normalized_question="猫窝能否清洗", matched_question_id=review_id)
+    _stub_llm(monkeypatch, [result, result])
+
+    with monkeypatch.context() as failed_write:
+        failed_write.setattr(repository, "set_matched_review", AsyncMock(side_effect=RuntimeError("cursor failed")))
+        with pytest.raises(RuntimeError, match="cursor failed"):
+            await flywheel.process_pending()
+
+    old = await repository.list_review_queue(None)
+    assert [(row.id, row.review_status, row.occurrence_count) for row in old] == (
+        [(review_id, existing_status, 1)] if existing_status else []
+    )
+    assert len(await repository.fetch_unmatched_low_conf(10)) == 1
+
+    assert (await flywheel.process_pending())["processed"] == 1
+    [candidate] = await repository.list_review_queue(None)
+    assert candidate.review_status == (existing_status or "待审")
+    assert candidate.occurrence_count == (2 if existing_status else 1)
+    assert await repository.fetch_unmatched_low_conf(10) == []
+
+
+@pytest.mark.parametrize("has_candidate", [False, True])
+async def test_two_batches_apply_one_update_for_the_same_source(db_session_factory, monkeypatch, has_candidate):
+    review_id = await repository.insert_review_item("猫窝能否清洗", None) if has_candidate else None
+    await repository.insert_low_confidence(None, "猫窝怎么洗", "self_check", None)
+    model_calls = 0
+    both_picked_source = asyncio.Event()
+
+    async def both_finish_matching(question, candidates):
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 2:
+            both_picked_source.set()
+        await asyncio.wait_for(both_picked_source.wait(), 5)
+        return NormalizeResult(normalized_question="猫窝能否清洗", matched_question_id=review_id)
+
+    monkeypatch.setattr(flywheel, "normalize_and_match", both_finish_matching)
+    batches = await asyncio.gather(flywheel.process_pending(), flywheel.process_pending())
+    assert sum(batch["processed"] for batch in batches) == 1
+    [candidate] = await repository.list_review_queue(None)
+    assert candidate.occurrence_count == (2 if has_candidate else 1)
+    assert await repository.fetch_unmatched_low_conf(10) == []
