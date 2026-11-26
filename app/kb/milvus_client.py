@@ -5,6 +5,9 @@
 import asyncio
 import functools
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+
+from anyio import CancelScope
 
 from pymilvus import (
     AnnSearchRequest, DataType, Function, FunctionType, MilvusClient, RRFRanker,
@@ -21,10 +24,24 @@ DIM = 1024
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="milvus")
 
 
-async def acall(fn, *args, **kwargs):
-    """在专用单线程上执行同步 pymilvus 调用(供 async 在线路径用)。"""
+async def acall(fn, *args, wait_on_cancel: bool = False, **kwargs):
+    """Run a sync Milvus call on its dedicated thread."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_EXECUTOR, functools.partial(fn, *args, **kwargs))
+    call = loop.run_in_executor(_EXECUTOR, functools.partial(fn, *args, **kwargs))
+    if not wait_on_cancel:
+        return await call
+
+    try:
+        return await asyncio.shield(call)
+    except asyncio.CancelledError:
+        # Publication must keep its database locks until the thread finishes.
+        with CancelScope(shield=True):
+            while not call.done():
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(call)
+        if not call.cancelled():
+            call.exception()
+        raise
 
 _CLIENT: MilvusClient | None = None
 _ensured: set[str] = set()

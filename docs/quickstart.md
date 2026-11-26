@@ -51,6 +51,12 @@ uv run python -m scripts.migrate_mysql --apply
 
 预检发现部分完成时会列出已存在和缺失的对象，退出码为 2。若中断发生在完整的 `ALTER TABLE` 之间，`--apply` 可继续执行剩余语句。若同一条语句的对象只出现一部分、结构与预期不同，或版本校验和不符，`--apply` 会在写入前停止。此时根据报告核对结构和备份，再运行预检。
 
+## 政策向量更新与补跑
+
+更新知识文件后执行 `make kb-repatch`，再用 `make kb-vectorize` 补齐 `pending`。若嵌入期间正文又被修改，该块会留待下一次向量化。发布时锁定当前知识块，Milvus 刷盘后才回标完成。
+
+此变更无需迁移。升级前先结束旧版本的向量化作业和补丁脚本。若存量块的 MySQL 正文和已发布索引不一致，暂停写入作业后按已核对的知识块 ID 将 MySQL 的 `vectorize_status` 恢复为 `pending`，再运行新版 `make kb-vectorize` 并检查实际检索结果。补跑沿用原知识块 ID。
+
 ## 真实用户部署
 
 用环境变量 `MEWHELP_AUTH_MODE=required` 启用身份校验，`MEWHELP_AUTH_FILE` 指向仓库外的凭证 JSON 文件。仅经 HTTPS 反向代理访问应用，把数据库和业务 MCP 留在私网。由运营人员给每个账户分配随机 32 字节以上的凭证，文件只记录凭证 UTF-8 字符串的 SHA-256 十六进制摘要。重启服务加载变更。配置文件格式如下：
