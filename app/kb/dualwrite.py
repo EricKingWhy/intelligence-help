@@ -2,10 +2,20 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
+import asyncio
+import logging
+from time import monotonic
+
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+
 from app.core import embeddings
 from app.db import repository
 from app.kb import milvus_client
 from app.kb.documents import Chunk
+
+
+logger = logging.getLogger(__name__)
+_PUBLICATION_TIMEOUT = 60.0
 
 
 async def write_pending(chunks: list[Chunk]) -> list[int]:
@@ -30,40 +40,79 @@ def _batches(items: list, size: int):
         yield items[i:i + size]
 
 
+def _vector_fields(chunk) -> dict:
+    return {
+        "id": chunk.id,
+        "text": f"{chunk.category}\n{chunk.questions}\n{chunk.answer}",
+        "question": chunk.questions,
+        "answer": chunk.answer,
+        "section_path": chunk.section_path or "",
+        "content_type": chunk.content_type or "",
+        "category": chunk.category or "",
+    }
+
+
+def _prepare_index(client, collection: str):
+    client = client or milvus_client.get_client()
+    milvus_client.ensure_collection(client, collection=collection)
+    return client
+
+
+def _write_vectors(client, rows: list[dict], collection: str) -> None:
+    deadline = monotonic() + _PUBLICATION_TIMEOUT
+    milvus_client.upsert_vectors(client, rows, collection=collection, timeout=_PUBLICATION_TIMEOUT)
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Milvus publication deadline exceeded")
+    milvus_client.flush(client, collection=collection, timeout=remaining)
+
+
+async def _publish_current(client, snapshots: list[dict], vectors, collection: str) -> int:
+    rows = []
+    try:
+        async with repository.lock_pending_chunks([snapshot["id"] for snapshot in snapshots]) as (session, current):
+            for snapshot, vector in zip(snapshots, vectors, strict=True):
+                row = current.get(snapshot["id"])
+                if row is not None and snapshot == _vector_fields(row):
+                    rows.append({**snapshot, "dense": vector})
+            if not rows:
+                return 0
+
+            await asyncio.wait_for(
+                milvus_client.acall(_write_vectors, client, rows, collection, wait_on_cancel=True),
+                timeout=_PUBLICATION_TIMEOUT,
+            )
+            for row in rows:
+                await repository.mark_chunk_vectorized(row["id"], str(row["id"]), session=session)
+    except DBAPIError as exc:
+        if exc.connection_invalidated and rows:
+            chunk_ids = [row["id"] for row in rows]
+            try:
+                await repository.requeue_vectorized_chunks(chunk_ids)
+            except SQLAlchemyError:
+                logger.exception("MySQL disconnected during Milvus publication; requeue chunk IDs %s", chunk_ids)
+        raise
+    return len(rows)
+
+
 async def vectorize_pending(
     client=None, batch_size: int = 64, collection: str = milvus_client.COLLECTION,
     *, chunk_ids: list[int] | None = None,
 ) -> int:
-    """幂等可重跑:取 pending → 拼 category+questions+answer → 嵌入 + BM25 text → Milvus upsert(PK=id)
-    → 回填 vector_id、status=done。
-    ch09:client 缺省时在 Milvus 专用线程内惰性创建,upsert/flush 也走 acall——
-    server 进程(审核通过写回)与脚本两个场景共用一条安全路径(gRPC 客户端跨线程
-    共享在 async server 下会间歇空返回,见 retrieval.py 注)。"""
+    """Embed pending snapshots, then publish only rows that are still current."""
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     pending = (await repository.list_pending_chunks() if chunk_ids is None
                else await repository.list_pending_chunks(chunk_ids))
     done = 0
+    index = None
     for batch in _batches(pending, batch_size):
-        texts = [f"{r.category}\n{r.questions}\n{r.answer}" for r in batch]
-        vectors = await embeddings.embed_texts(texts)
+        snapshots = [_vector_fields(chunk) for chunk in batch]
+        vectors = await embeddings.embed_texts([snapshot["text"] for snapshot in snapshots])
         if len(vectors) != len(batch):
             raise ValueError(f"Expected {len(batch)} embeddings, received {len(vectors)}")
-        rows = [
-            {"id": r.id, "dense": v, "text": t,
-             "question": r.questions, "answer": r.answer,
-             "section_path": r.section_path or "", "content_type": r.content_type or "",
-             "category": r.category or ""}
-            for r, v, t in zip(batch, vectors, texts)
-        ]
 
-        def write_batch():
-            c = client or milvus_client.get_client()
-            milvus_client.ensure_collection(c, collection=collection)
-            milvus_client.upsert_vectors(c, rows, collection=collection)
-            milvus_client.flush(c, collection=collection)
-        await milvus_client.acall(write_batch)
-        for r in batch:
-            await repository.mark_chunk_vectorized(r.id, str(r.id))
-        done += len(batch)
+        if index is None:
+            index = await milvus_client.acall(_prepare_index, client, collection)
+        done += await _publish_current(index, snapshots, vectors, collection)
     return done

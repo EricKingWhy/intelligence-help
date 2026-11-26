@@ -103,3 +103,47 @@ async def test_vectorize_resumes_after_crash(db_session_factory, milvus, monkeyp
     client.load_collection(name)
     import time; time.sleep(2)  # 等新段对 query 可见
     assert milvus_client.count(client, collection=name) == 4  # 无重无漏
+
+
+@pytest.mark.parametrize("new_finishes_first", [False, True])
+async def test_edited_policy_is_searchable_even_when_old_embedding_returns_last(
+    db_session_factory, milvus, monkeypatch, new_finishes_first,
+):
+    client, name = milvus
+    [chunk_id] = await dualwrite.write_pending([_chunk("保修期限", "旧政策保修一年")])
+    old_embedding = asyncio.Event()
+    release_old = asyncio.Event()
+
+    async def embed(texts):
+        if texts[0].endswith("旧政策保修一年"):
+            old_embedding.set()
+            await release_old.wait()
+        return [[0.05] * milvus_client.DIM for _ in texts]
+
+    monkeypatch.setattr(dualwrite.embeddings, "embed_texts", embed)
+    old_task = asyncio.create_task(dualwrite.vectorize_pending(client, collection=name, chunk_ids=[chunk_id]))
+    try:
+        await asyncio.wait_for(old_embedding.wait(), 5)
+        await asyncio.wait_for(repository.repend_chunk_text(chunk_id, "保修期限", "新政策保修两年"), 5)
+        if new_finishes_first:
+            assert await dualwrite.vectorize_pending(client, collection=name, chunk_ids=[chunk_id]) == 1
+    finally:
+        release_old.set()
+        old_count = await old_task
+
+    assert old_count == 0
+    if not new_finishes_first:
+        [pending] = await repository.list_pending_chunks([chunk_id])
+        assert pending.answer == "新政策保修两年"
+        assert await dualwrite.vectorize_pending(client, collection=name, chunk_ids=[chunk_id]) == 1
+
+    assert await repository.list_pending_chunks([chunk_id]) == []
+    await milvus_client.acall(client.load_collection, name)
+    for _ in range(10):
+        hits = await milvus_client.acall(milvus_client.bm25_search, client, "保修期限", 2, collection=name)
+        if hits:
+            assert [(hit["id"], hit["answer"]) for hit in hits] == [(chunk_id, "新政策保修两年")]
+            break
+        await asyncio.sleep(0.3)
+    else:
+        pytest.fail("Updated policy did not become searchable")

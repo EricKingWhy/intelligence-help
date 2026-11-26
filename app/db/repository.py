@@ -2,10 +2,14 @@
 # 后端八股网站：xiaolincoding.com
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, cast, func, select, update
+from sqlalchemy.dialects.mysql import BINARY
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.db.base as db          # 用模块属性引用,便于测试 monkeypatch async_session
 from app.db.models import (
@@ -238,7 +242,10 @@ async def list_conversations(user_id: str, limit: int = 50) -> list[dict]:
     query = (
         select(Conversation.id, Conversation.status, func.length(Conversation.summary).label("summary_length"),
                Conversation.updated_at, preview.label("preview"))
-        .where(Conversation.user_id == user_id)
+        .where(
+            Conversation.user_id == user_id,  # keep the indexed lookup
+            cast(Conversation.user_id, BINARY) == user_id.encode("utf-8"),
+        )
         .order_by(Conversation.id.desc())
         .limit(limit)
     )
@@ -291,13 +298,38 @@ async def list_pending_chunks(chunk_ids: list[int] | None = None) -> list[Knowle
         return list(result.scalars())
 
 
-async def mark_chunk_vectorized(chunk_id: int, vector_id: str) -> None:
-    async with db.async_session() as s:
+@asynccontextmanager
+async def lock_pending_chunks(
+    chunk_ids: list[int],
+) -> AsyncIterator[tuple[AsyncSession, dict[int, KnowledgeChunk]]]:
+    """Hold row locks through the index write and the status commit."""
+    async with db.async_session.begin() as session:
+        rows = await session.scalars(
+            select(KnowledgeChunk)
+            .where(KnowledgeChunk.id.in_(chunk_ids))
+            .order_by(KnowledgeChunk.id)
+            .with_for_update()
+        )
+        yield session, {row.id: row for row in rows if row.vectorize_status == "pending"}
+
+
+async def mark_chunk_vectorized(chunk_id: int, vector_id: str, *, session: AsyncSession | None = None) -> None:
+    context = db.async_session.begin() if session is None else nullcontext(session)
+    async with context as s:
         row = await s.get(KnowledgeChunk, chunk_id)
         if row is not None:
             row.vector_id = vector_id
             row.vectorize_status = "done"
-            await s.commit()
+
+
+async def requeue_vectorized_chunks(chunk_ids: list[int]) -> None:
+    """Rebuild affected vectors from the current text after an uncertain publication."""
+    async with db.async_session.begin() as session:
+        await session.execute(
+            update(KnowledgeChunk)
+            .where(KnowledgeChunk.id.in_(chunk_ids), KnowledgeChunk.vectorize_status == "done")
+            .values(vectorize_status="pending")
+        )
 
 
 async def set_chunk_neighbors(chunk_id: int, prev_id: int | None, next_id: int | None) -> None:
@@ -327,13 +359,13 @@ async def repend_chunk_text(chunk_id: int, questions: str, answer: str) -> None:
     为什么不是「删掉重插」:Milvus 那边 upsert 的主键就是这个 id,原地重嵌等于原地更新,
     引用角标、prev/next 邻居指针、飞轮写回的块都不受影响。整库重建(kb-reset)会连飞轮
     审核通过写回的那些块一起清掉,补库这种小改动犯不上。"""
-    async with db.async_session() as s:
-        row = await s.get(KnowledgeChunk, chunk_id)
-        if row is not None:
-            row.questions = questions
-            row.answer = answer
-            row.vectorize_status = "pending"
-            await s.commit()
+    async with db.async_session.begin() as session:
+        # Assign pending in the same UPDATE, even if the previous value was pending.
+        await session.execute(
+            update(KnowledgeChunk)
+            .where(KnowledgeChunk.id == chunk_id)
+            .values(questions=questions, answer=answer, vectorize_status="pending")
+        )
 
 
 async def count_chunks_by_status(status: str) -> int:

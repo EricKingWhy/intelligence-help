@@ -5,6 +5,9 @@
 import asyncio
 import functools
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+
+from anyio import CancelScope
 
 from pymilvus import (
     AnnSearchRequest, DataType, Function, FunctionType, MilvusClient, RRFRanker,
@@ -21,10 +24,27 @@ DIM = 1024
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="milvus")
 
 
-async def acall(fn, *args, **kwargs):
-    """在专用单线程上执行同步 pymilvus 调用(供 async 在线路径用)。"""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_EXECUTOR, functools.partial(fn, *args, **kwargs))
+async def acall(fn, *args, wait_on_cancel: bool = False, **kwargs):
+    """Run a sync Milvus call on its dedicated thread."""
+    work = functools.partial(fn, *args, **kwargs)
+    if not wait_on_cancel:
+        return await asyncio.get_running_loop().run_in_executor(_EXECUTOR, work)
+
+    submitted = _EXECUTOR.submit(work)
+    call = asyncio.wrap_future(submitted)
+    try:
+        return await asyncio.shield(call)
+    except asyncio.CancelledError:
+        if submitted.cancel():
+            raise
+        # A running publication must keep its database locks until the thread finishes.
+        with CancelScope(shield=True):
+            while not call.done():
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(call)
+        if not call.cancelled():
+            call.exception()
+        raise
 
 _CLIENT: MilvusClient | None = None
 _ensured: set[str] = set()
@@ -75,14 +95,16 @@ def ensure_collection(client: MilvusClient, collection: str = COLLECTION) -> Non
         _ensured.add(collection)
 
 
-def upsert_vectors(client: MilvusClient, rows: list[dict], collection: str = COLLECTION) -> None:
+def upsert_vectors(
+    client: MilvusClient, rows: list[dict], collection: str = COLLECTION, *, timeout: float | None = None,
+) -> None:
     if rows:
-        client.upsert(collection, rows)
+        client.upsert(collection, rows, timeout=timeout)
 
 
-def flush(client: MilvusClient, collection: str = COLLECTION) -> None:
+def flush(client: MilvusClient, collection: str = COLLECTION, *, timeout: float | None = None) -> None:
     """刷盘:新 upsert 的数据须 flush 后才可被 BM25/检索命中(Task 1 实证)。"""
-    client.flush(collection)
+    client.flush(collection, timeout=timeout)
 
 
 def _cat_expr(category: str | None) -> str:
