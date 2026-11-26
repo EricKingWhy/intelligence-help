@@ -5,7 +5,8 @@
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, cast, func, select, update
+from sqlalchemy.dialects.mysql import BINARY
 
 import app.db.base as db          # 用模块属性引用,便于测试 monkeypatch async_session
 from app.db.models import (
@@ -238,7 +239,10 @@ async def list_conversations(user_id: str, limit: int = 50) -> list[dict]:
     query = (
         select(Conversation.id, Conversation.status, func.length(Conversation.summary).label("summary_length"),
                Conversation.updated_at, preview.label("preview"))
-        .where(Conversation.user_id == user_id)
+        .where(
+            Conversation.user_id == user_id,  # keep the indexed lookup
+            cast(Conversation.user_id, BINARY) == user_id.encode("utf-8"),
+        )
         .order_by(Conversation.id.desc())
         .limit(limit)
     )
