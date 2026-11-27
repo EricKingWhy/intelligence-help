@@ -15,6 +15,7 @@ from sklearn.metrics import multilabel_confusion_matrix, precision_recall_fscore
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from app.core.taxonomy import LABEL2ID, NUM_CLASSES, SEVERITY, TOPIC_NAMES
+from scripts.ch10.holdout import error_patterns, validate_checkpoint
 from scripts.ch10.inference_lib import apply_threshold
 
 MODEL_DIR = pathlib.Path("data/ch10/model")
@@ -29,7 +30,7 @@ def pick_device() -> str:
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-def predict(model, tokenizer, texts: list[str], threshold: float, device: str) -> np.ndarray:
+def predict_probabilities(model, tokenizer, texts: list[str], device: str) -> np.ndarray:
     model.eval()
     probs_all = []
     with torch.no_grad():
@@ -37,14 +38,16 @@ def predict(model, tokenizer, texts: list[str], threshold: float, device: str) -
             enc = tokenizer(texts[i:i + 32], truncation=True, padding=True,
                             max_length=128, return_tensors="pt").to(device)
             probs_all.append(torch.sigmoid(model(**enc).logits).cpu().numpy())
-    return apply_threshold(np.concatenate(probs_all), threshold)
+    return np.concatenate(probs_all)
 
 
-def main(*, samples=None, reports=REPORTS, dataset_metadata=None) -> None:
+def main(*, samples=None, reports=REPORTS, dataset_metadata=None, model_dir=MODEL_DIR) -> None:
     device = pick_device()
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).to(device)
-    threshold = json.loads((MODEL_DIR / "threshold.json").read_text())["threshold"]
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True).to(device)
+    threshold = json.loads((model_dir / "threshold.json").read_text(encoding="utf-8"))["threshold"]
+    if dataset_metadata is not None:
+        validate_checkpoint(model.config.id2label, model.config.problem_type, threshold)
     if samples is None:
         samples = [json.loads(l) for l in TEST.read_text(encoding="utf-8").splitlines() if l.strip()]
     texts = [s["text"] for s in samples]
@@ -52,7 +55,8 @@ def main(*, samples=None, reports=REPORTS, dataset_metadata=None) -> None:
     for i, s in enumerate(samples):
         for lb in s["labels"]:
             gold[i][LABEL2ID[lb]] = 1
-    preds = predict(model, tokenizer, texts, threshold, device)
+    probabilities = predict_probabilities(model, tokenizer, texts, device)
+    preds = apply_threshold(probabilities, threshold)
 
     p, r, f1, support = precision_recall_fscore_support(gold, preds, zero_division=0)
     micro_p, micro_r, micro_f1, _ = precision_recall_fscore_support(
@@ -143,15 +147,31 @@ def main(*, samples=None, reports=REPORTS, dataset_metadata=None) -> None:
                 )[2]) for average in ("micro", "macro")},
             }
         baseline = json.loads((REPORTS / "eval_report.json").read_text(encoding="utf-8"))
-        report["baseline_f1_delta"] = {average: report[average]["f1"] - baseline[average]["f1"]
-                                       for average in ("micro", "macro")}
+        report["baseline_threshold"] = baseline["threshold"]
+        report["baseline_f1_delta"] = None
+        if threshold == baseline["threshold"]:
+            report["baseline_f1_delta"] = {
+                average: report[average]["f1"] - baseline[average]["f1"] for average in ("micro", "macro")
+            }
         report["missed_labels"] = Counter(label for error in errors for label in error["missed"])
         report["extra_labels"] = Counter(label for error in errors for label in error["extra"])
+        report["error_patterns"] = patterns = error_patterns(samples, probabilities, threshold, errors)
         for cls in report["classes"]:
             cls["limited_support"] = cls["support"] < 10
         lines += ["", "## 真实留出集", "",
                   f"版本 {dataset_metadata['version']}。每类少于 10 条正例时，指标需结合样本数解释。",
-                  f"对既有报告的 F1 差异 {report['baseline_f1_delta']}。"]
+                  f"既有报告的阈值为 {baseline['threshold']}。"]
+        if report["baseline_f1_delta"] is None:
+            lines.append("两次阈值不同，省略直接 F1 差值。")
+        else:
+            lines.append(f"对既有报告的 F1 差异 {report['baseline_f1_delta']}。")
+        lines += ["", "| 场景 | 样本数 | 错例数 |", "|---|---|---|"]
+        for key, label in (("low_confidence", "所有标签均低于阈值"), ("multi_intent", "人工标注多个主题")):
+            pattern = patterns[key]
+            lines.append(f"| {label} | {pattern['n']} | {len(pattern['error_ids'])} |")
+        lines += ["", "后续优先补采少于 10 条正例的类别和反复同时漏打、多打的标签组合。"]
+        for pair in patterns["missed_extra_pairs"][:10]:
+            lines.append(f"- 漏打「{pair['missed']}」、多打「{pair['extra']}」同时出现 {pair['count']} 次。")
     (reports / "eval_report.md").write_text("\n".join(lines), encoding="utf-8")
     (reports / "eval_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
