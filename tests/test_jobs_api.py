@@ -213,3 +213,54 @@ async def test_job_polls_leave_event_loop_available(app, client, monkeypatch, tm
         release.set()
         responses = await asyncio.gather(*polls)
     assert all(response.json()["log"] == "正在运行" for response in responses)
+
+
+async def test_poll_does_not_pair_new_log_with_previous_run(client, monkeypatch, tmp_path):
+    name = "kb-preview"
+    monkeypatch.setattr(jobs, "LOG_DIR", tmp_path)
+    monkeypatch.setitem(jobs._runs, name, jobs.JobRun(status="ok", pid=111))
+    path = tmp_path / f"{name}.log"
+    path.write_text("上一轮", encoding="utf-8")
+    url = f"/api/jobs/{name}"
+    original_open = pathlib.Path.open
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+
+    def open_log(file_path, mode="r", *args, **kwargs):
+        if file_path == path and mode == "rb" and not release.is_set():
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(3)
+        return original_open(file_path, mode, *args, **kwargs)
+
+    class Process:
+        pid = 222
+
+        async def wait(self):
+            return 0
+
+    async def launch(*args, **kwargs):
+        return Process()
+
+    monkeypatch.setattr(pathlib.Path, "open", open_log)
+    monkeypatch.setattr(jobs.asyncio, "create_subprocess_exec", launch)
+    poll = asyncio.create_task(client.get(url))
+    start = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        start = asyncio.create_task(client.post(url))
+        # Wait for the new run to replace the file before letting either reader proceed.
+        async with asyncio.timeout(2):
+            while jobs._runs[name].pid != 222:
+                await asyncio.sleep(0)
+    finally:
+        release.set()
+        response = await poll
+        if start is not None:
+            await start
+            await jobs._runs[name].watcher
+
+    assert response.json()["pid"] == 222
+    assert response.json()["log"] == ""
+    current = (await client.get(url)).json()
+    assert current["log"].startswith("$ make kb-preview")

@@ -93,6 +93,7 @@ class JobRun:
     finished_at: str | None = None
     returncode: int | None = None
     starting: bool = field(default=False, repr=False)
+    log_revision: int = field(default=0, repr=False)
     proc: asyncio.subprocess.Process | None = field(default=None, repr=False)
     watcher: asyncio.Task | None = field(default=None, repr=False)
 
@@ -122,6 +123,7 @@ async def start(name: str) -> JobRun:
     header = (f"$ {' '.join(spec.argv)}\n"
               f"# {dt.datetime.now().isoformat(timespec='seconds')} 由后台页发起\n\n")
     path.write_text(header, encoding="utf-8")          # 每次覆盖:窗口里只看本次
+    run.log_revision += 1
     fh = path.open("a", encoding="utf-8", buffering=1)
     # ponytail: 作业状态在单个服务进程内共享，多 worker 部署需要共享作业状态。
     run.starting = True
@@ -225,8 +227,13 @@ def status(name: str, with_log: bool = False) -> dict:
 
 
 async def status_with_log(name: str) -> dict:
-    run = _run_status(name)
-    return run | await asyncio.to_thread(_log_status, name, True)
+    run = _run(name)
+    revision = run.log_revision
+    log = await asyncio.to_thread(_log_status, name, True)
+    if revision != run.log_revision:
+        # A new run replaced the file during the read. The next poll will show its log.
+        log = {"log_mtime": None, "log": ""}
+    return _run_status(name) | log
 
 
 def status_all() -> list[dict]:
