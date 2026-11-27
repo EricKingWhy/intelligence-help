@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from sqlalchemy import case, cast, func, select, update
 from sqlalchemy.dialects.mysql import BINARY
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.db.base as db          # 用模块属性引用,便于测试 monkeypatch async_session
@@ -96,22 +97,33 @@ async def list_messages(conversation_id: int) -> list[Message]:
         return list(result.scalars())
 
 
+def _ticket_replay(ticket: Ticket, description: str, ticket_type: str) -> str:
+    if (ticket.description, ticket.ticket_type) != (description, ticket_type):
+        raise SubmissionConflict
+    return ticket.ticket_no
+
+
 async def create_ticket(
     conversation_id: int, description: str, ticket_type: str, *, submission_key: str | None = None,
     handoff_context: dict | None = None,
 ) -> str:
     ticket_no = _gen_ticket_no()
     async with db.async_session() as s:
-        # The conversation lock serializes submissions across application processes.
         conv = await s.get(Conversation, conversation_id, with_for_update=True)
+        submission_owner = None
+        replay_query = None
         if submission_key is not None:
-            previous = await s.scalar(select(Ticket).where(
-                Ticket.conversation_id == conversation_id, Ticket.submission_key == submission_key,
-            ))
+            # The validated conversation supplies the exact account. Agent and handoff keys
+            # identify work within that conversation and remain bound to it.
+            if conv is not None and submission_key.startswith(("ticket:", "refund:")):
+                submission_owner = conv.user_id.encode("utf-8")
+                scope = Ticket.submission_owner == submission_owner
+            else:
+                scope = Ticket.conversation_id == conversation_id
+            replay_query = select(Ticket).where(scope, Ticket.submission_key == submission_key)
+            previous = await s.scalar(replay_query)
             if previous is not None:
-                if (previous.description, previous.ticket_type) != (description, ticket_type):
-                    raise SubmissionConflict
-                return previous.ticket_no
+                return _ticket_replay(previous, description, ticket_type)
         s.add(
             Ticket(
                 ticket_no=ticket_no,
@@ -119,12 +131,24 @@ async def create_ticket(
                 description=description,
                 ticket_type=ticket_type,
                 submission_key=submission_key,
+                submission_owner=submission_owner,
                 handoff_context=handoff_context,
             )
         )
         if conv is not None:
             conv.status = "已转人工"
-        await s.commit()
+        try:
+            await s.commit()
+        except IntegrityError:
+            if submission_owner is None or replay_query is None:
+                raise
+            # Another conversation may win the unique-key race. Roll back the losing
+            # insert and status change before reading the winner in a new transaction.
+            await s.rollback()
+            previous = await s.scalar(replay_query)
+            if previous is None:
+                raise
+            return _ticket_replay(previous, description, ticket_type)
     return ticket_no
 
 

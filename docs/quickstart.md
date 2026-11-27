@@ -45,11 +45,36 @@ uv run python -m scripts.migrate_mysql
 uv run python -m scripts.migrate_mysql --apply
 ```
 
-`--apply` 按顺序执行 ch11、ch12，并在 `mewhelp_schema_migrations` 记录版本和 SQL 校验和。此前手工执行或由 Docker 初始化的版本，经结构核对后会补记版本记录。对已创建的空数据库，该命令先建 ch02–ch10 的表结构，演示数据仍按上文另行加载。
+`--apply` 按顺序执行 ch11–ch13，并在 `mewhelp_schema_migrations` 记录版本和 SQL 校验和。此前手工执行或由 Docker 初始化的版本，经结构核对后会补记版本记录。对已创建的空数据库，该命令先建 ch02–ch10 的表结构，演示数据仍按上文另行加载。
 
-存量库预检会核对应用 ORM 使用的 ch02–ch10 基线列及两处历史枚举，并按版本检查 ch11、ch12 新增对象的定义和记录校验和。即使已有版本记录，基线缺列也会列出具体的 `表.列`，退出码为 2。补齐基线后可重新预检。
+存量库预检会核对应用 ORM 使用的 ch02–ch10 基线列及两处历史枚举，并按版本检查 ch11–ch13 新增对象的定义和记录校验和。即使已有版本记录，基线缺列也会列出具体的 `表.列`，退出码为 2。补齐基线后可重新预检。
 
 预检发现部分完成时会列出已存在和缺失的对象，退出码为 2。若中断发生在完整的 `ALTER TABLE` 之间，`--apply` 可继续执行剩余语句。若同一条语句的对象只出现一部分、结构与预期不同，或版本校验和不符，`--apply` 会在写入前停止。此时根据报告核对结构和备份，再运行预检。
+
+
+### 工单提交标识升级
+
+ch13 将手动建单和退款按准确账号、业务动作及提交标识去重。旧工单保留原单号和原会话，已有手动提交的账号从原会话回填。升级前备份，并暂停会写工单的应用与工作进程。若只完成了 ch13 的结构变更，预检会提示待回填，可用 `--apply` 续跑。
+
+如果同一个账号曾在多个会话使用相同提交标识，预检会在改表前停止并给出冲突单号。可在维护库用下面的只读查询列出所有冲突。
+
+```sql
+WITH candidate_tickets AS (
+    SELECT t.ticket_no, t.conversation_id, t.submission_key, t.created_at,
+           COUNT(*) OVER (
+               PARTITION BY CAST(c.user_id AS BINARY), t.submission_key
+           ) AS use_count
+    FROM tickets t JOIN conversations c ON c.id = t.conversation_id
+    WHERE LEFT(t.submission_key, 7) IN ('ticket:', 'refund:')
+)
+SELECT ticket_no, conversation_id, submission_key, created_at
+FROM candidate_tickets WHERE use_count > 1
+ORDER BY submission_key, created_at, ticket_no;
+```
+
+逐组核对业务记录，确认哪笔保留原提交标识。保存冲突处理记录，保留所有工单和单号，仅清除重复工单上的旧 `submission_key`。如果 ch13 列已存在，同时清除该行的 `submission_owner`。重新通过预检后再执行升级。
+
+如需回滚应用，可保留新增列和索引。旧应用恢复工单写入后，重新部署新版前需检查冲突并补齐这段时间生成的提交账号。若 ch13 已登记，冲突清理后可在维护状态执行该版本 SQL 中的回填语句，再运行预检确认。
 
 ## 政策向量更新与补跑
 

@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
 HISTORY = "mewhelp_schema_migrations"
+TICKET_SCOPE_VERSION = "ch13-ticket-submission-scope.sql"
+TICKET_SCOPE_KEYS = "(LEFT(t.submission_key, 7) IN ('ticket:', 'refund:'))"
 BASELINE = (
     "ch02-ddl.sql", "ch03-ddl.sql", "ch03-staging-review.sql", "ch04-ddl.sql",
     "ch06-ticket-type.sql", "ch07-ddl.sql", "ch08-ddl.sql", "ch09-ddl.sql", "ch10-ddl.sql",
@@ -27,6 +29,10 @@ VERSIONS = {
         (("messages.handoff_context", ("json", "YES")),),
         (("tickets.handoff_context", ("json", "YES")), ("tickets.assigned_to", ("varchar(64)", "YES")),
          ("tickets.resolution", ("text", "YES"))),
+    ),
+    TICKET_SCOPE_VERSION: (
+        (("tickets.submission_owner", ("varbinary(256)", "YES")),
+         ("tickets.uq_ticket_account_submission", ((0, "submission_owner", None), (0, "submission_key", None)))),
     ),
 }
 
@@ -61,13 +67,16 @@ async def inspect_schema(conn):
         "FROM information_schema.columns WHERE table_schema = DATABASE()"
     ))).all()
     indexes = (await conn.execute(text(
-        "SELECT non_unique, column_name, sub_part FROM information_schema.statistics "
+        "SELECT index_name, non_unique, column_name, sub_part FROM information_schema.statistics "
         "WHERE table_schema = DATABASE() AND table_name = 'tickets' "
-        "AND index_name = 'uq_ticket_submission' ORDER BY seq_in_index"
+        "AND index_name IN ('uq_ticket_submission', 'uq_ticket_account_submission') "
+        "ORDER BY index_name, seq_in_index"
     ))).all()
     catalog = {f"{table}.{name}": (kind, nullable, collation) for table, name, kind, nullable, collation in columns}
-    if indexes:
-        catalog["tickets.uq_ticket_submission"] = tuple(map(tuple, indexes))
+    index_shapes = {}
+    for name, non_unique, column, prefix in indexes:
+        index_shapes.setdefault(f"tickets.{name}", []).append((non_unique, column, prefix))
+    catalog.update({name: tuple(shape) for name, shape in index_shapes.items()})
     tables = {row[0] for row in columns}
     history = {}
     if HISTORY in tables:
@@ -83,13 +92,43 @@ def step_status(catalog, expected):
         actual = catalog.get(key)
         if actual is None:
             missing.append(key)
-        elif actual[:len(shape)] == shape and (
-            key != "tickets.uq_ticket_submission" or actual == shape
-        ):
+        elif (actual if isinstance(shape[0], tuple) else actual[:len(shape)]) == shape:
             present.append(key)
         else:
             mismatched.append(f"{key}: expected {shape}, found {actual}")
     return present, missing, mismatched
+
+
+async def _submission_owner_pending(conn) -> bool:
+    return bool(await conn.scalar(text(
+        f"SELECT EXISTS (SELECT 1 FROM tickets t WHERE {TICKET_SCOPE_KEYS} AND t.submission_owner IS NULL)"
+    )))
+
+
+async def _preflight_ticket_scope(conn, *, has_owner, recorded) -> bool:
+    conflicts = (await conn.exec_driver_sql(
+        "SELECT MIN(t.ticket_no), MAX(t.ticket_no), COUNT(*) "
+        "FROM tickets t JOIN conversations c ON c.id = t.conversation_id "
+        f"WHERE {TICKET_SCOPE_KEYS} GROUP BY CAST(c.user_id AS BINARY), t.submission_key "
+        "HAVING COUNT(*) > 1 ORDER BY MIN(t.ticket_no) LIMIT 5"
+    )).all()
+    if conflicts:
+        examples = "、".join(f"{first} / {last}（{count} 条）" for first, last, count in conflicts)
+        raise PreflightError(f"同账号提交标识存在历史冲突，先核对原工单：{examples}")
+    if not has_owner:
+        return False
+
+    wrong_owner = await conn.scalar(text(
+        "SELECT t.ticket_no FROM tickets t JOIN conversations c ON c.id = t.conversation_id "
+        "WHERE t.submission_owner IS NOT NULL AND NOT (t.submission_owner <=> "
+        f"CASE WHEN {TICKET_SCOPE_KEYS} THEN CAST(c.user_id AS BINARY) END) LIMIT 1"
+    ))
+    if wrong_owner is not None:
+        raise PreflightError(f"工单提交账号与会话归属不一致：{wrong_owner}")
+    pending = await _submission_owner_pending(conn)
+    if recorded and pending:
+        raise PreflightError(f"{TICKET_SCOPE_VERSION} 已记录，但仍有工单提交账号未回填")
+    return pending
 
 
 async def migrate(conn, *, apply=False):
@@ -115,6 +154,11 @@ async def migrate(conn, *, apply=False):
         source = (SQL_DIR / version).read_text(encoding="utf-8")
         digest = hashlib.sha256(source.encode()).hexdigest()
         statements = sql_statements(source)
+        backfill = None
+        if version == TICKET_SCOPE_VERSION:
+            if not statements or not statements[-1].startswith("UPDATE tickets "):
+                raise PreflightError(f"{version} 缺少工单提交账号回填")
+            backfill = statements.pop()
         if len(statements) != len(shapes) or any(not stmt.startswith("ALTER TABLE ") for stmt in statements):
             raise PreflightError(f"{version} 的 SQL 与预检定义不一致")
         states = [step_status(catalog, shape) for shape in shapes]
@@ -146,10 +190,15 @@ async def migrate(conn, *, apply=False):
             print("  已存在：" + ", ".join(present))
         prior_incomplete = prior_incomplete or bool(missing or mismatched)
         pending = [stmt for stmt, (_, needed, _) in zip(statements, states, strict=True) if needed]
-        plan.append((version, digest, shapes, pending))
+        plan.append((version, digest, shapes, pending, backfill))
 
     if errors:
         raise PreflightError("\n".join(errors))
+    if "tickets.submission_key" in catalog and await _preflight_ticket_scope(
+        conn, has_owner="tickets.submission_owner" in catalog, recorded=TICKET_SCOPE_VERSION in history,
+    ):
+        print(f"{TICKET_SCOPE_VERSION}: 部分完成，待回填工单提交账号")
+        interrupted = True
     if not apply:
         return 2 if interrupted else 0
 
@@ -164,7 +213,7 @@ async def migrate(conn, *, apply=False):
             "recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB"
         )
 
-    for version, digest, shapes, pending in plan:
+    for version, digest, shapes, pending, backfill in plan:
         if version in history:
             continue
         for stmt in pending:
@@ -172,6 +221,10 @@ async def migrate(conn, *, apply=False):
         current, _, _ = await inspect_schema(conn)
         if any(missing or drift for _, missing, drift in (step_status(current, shape) for shape in shapes)):
             raise PreflightError(f"{version} 执行后结构与预期不一致")
+        if backfill is not None:
+            await conn.exec_driver_sql(backfill)
+            if await _submission_owner_pending(conn):
+                raise PreflightError(f"{version} 未完成工单提交账号回填")
         await conn.execute(text(f"INSERT INTO {HISTORY} (version, sha256) VALUES (:version, :digest)"),
                            {"version": version, "digest": digest})
         print(f"{version}: 已写入版本记录")
