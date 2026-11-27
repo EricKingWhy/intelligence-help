@@ -22,7 +22,9 @@ uv run python -m scripts.eval_rag_tradeoffs --kb-version v1 --output /tmp/rag-tr
 uv run --group ml python -m scripts.ch10.holdout \
   --holdout /secure/real.jsonl --manifest /secure/manifest.json \
   --train /secure/train-with-groups.jsonl --validation /secure/val-with-groups.jsonl \
-  --report-dir /secure/real-report
+  --model-dir /secure/fixed-model --report-dir /secure/real-report
 ```
 
-加 `--audit-only` 可在加载模型前检查数据重叠。评分复用 `data/ch10/model` 中的模型和验证集阈值，输出各桶 F1、每类支持数、漏打和多打次数，以及可在受控目录复核的匿名错例 ID。报告文件使用独立目录。样本优先补给低支持类别与频繁混淆的标签组合。
+加 `--audit-only` 可在加载模型前检查数据重叠。每条对照样本的组 ID 必须是非空字符串，无首尾空格。省略 `--model-dir` 时使用 `data/ch10/model`。评测读取本地模型和已有的验证集阈值，并记录模型目录文件及输入数据的 SHA-256。
+
+报告包含整体与分桶指标、每类支持数、低置信和多意图样本数及错例 ID。低置信指所有标签分数低于阈值，多意图以人工标注的主题数量为准。匿名错例可在受控目录复核。后续优先补采支持数较低的类别和反复同时漏打、多打的标签组合。
