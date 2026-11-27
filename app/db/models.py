@@ -4,7 +4,7 @@
 # 简历模版：jianli.xiaolinnote.com
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, JSON, String, Text, func
+from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, JSON, String, Text, VARBINARY, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -63,6 +63,7 @@ class Ticket(Base):
     )
     description: Mapped[str] = mapped_column(Text)
     submission_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    submission_owner: Mapped[bytes | None] = mapped_column(VARBINARY(256), nullable=True)
     handoff_context: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
     assigned_to: Mapped[str | None] = mapped_column(String(64))
     resolution: Mapped[str | None] = mapped_column(Text)
