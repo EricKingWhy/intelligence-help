@@ -53,6 +53,9 @@ def run_smoke(monkeypatch, responses):
     "自签收起 7 日内，商品保持完好即可申请无理由退货。超过 7 日不支持无理由退货。[1]",
     "七天无理由退货政策仍然有效，前提是商品不影响二次销售。[1]",
     "签收后可以在 **7 天内**申请无理由退货，商品需完好。生鲜商品，七天无理由退货不适用。[1]",
+    "签收后七天内支持无理由退货[1]，商品需完好。生鲜类和定制类商品，均不适用无理由退货。",
+    "七天无理由退货政策有效，商品需要保持完好。[1]",
+    "商品完好可以无理由退货，请在签收后的七天内申请。[2][1]",
 ])
 def test_valid_demo_replies_pass_with_final_text_and_legacy_replacement(monkeypatch, capsys, policy_text):
     responses = [
@@ -84,6 +87,12 @@ def test_valid_demo_replies_pass_with_final_text_and_legacy_replacement(monkeypa
     ("政策", 1, wire(POLICY, final_text="现已停止提供七天无理由退货，商品需要保持完好。[1]")),
     ("政策", 1, wire(POLICY, final_text="有七天无理由退货吗？商品需保持完好。[1]")),
     ("政策", 1, wire(POLICY, final_text="支持七天无理由退货，商品需完好。但目前无理由退货政策已经作废。[1]")),
+    ("政策", 1, wire(POLICY, final_text="支持七天无理由退货，商品需完好。但七天无理由退货政策现已正式取消。[1]")),
+    ("政策", 1, wire(POLICY, final_text="支持七天无理由退货，商品需完好。但无理由退货政策已不再适用。[1]")),
+    ("政策", 1, wire(POLICY, final_text="支持七天无理由退货，商品需完好。但无理由退货政策自今日起停止执行。[1]")),
+    ("政策", 1, wire(POLICY, final_text="签收后七天内支持无理由退货，商品无需保持完好。[1]")),
+    ("政策", 1, wire(POLICY, final_text="签收后六天内可申请无理由退货，超过七天不支持无理由退货，商品需完好。[1]")),
+    ("政策", 1, wire(POLICY, final_text="支持七天无理由退货，商品需完好。[2]另有条款可供参考。[1]")),
     ("政策", 1, wire(POLICY, final_text="签收后七天内支持无理由退货。[1]")),
     ("政策", 1, wire(POLICY, final_text="签收后十七天内可申请无理由退货，商品需完好。[1]")),
     ("政策", 1, wire([POLICY[0], {"delta": "支持七天无理由退货，商品需完好。[2]"}])),
