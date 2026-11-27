@@ -968,7 +968,7 @@
     }
 
     // ---------- 聊天回复的可选操作 ----------
-    function renderActions(bubble, items) {
+    function renderActions(bubble, items, replyId) {
       const cid = getConversationId();
       const bar = document.createElement("div");
       bar.className = "action-bar";
@@ -996,7 +996,7 @@
         } else if (a.type === "create_ticket") {
           btn.textContent = "建工单";
           // 点「建工单」不再直接建单,而是弹出工单表单让用户选类别+填描述再提交
-          btn.addEventListener("click", () => openTicketModal(btn));
+          btn.addEventListener("click", () => openTicketModal(btn, replyId));
         } else if (a.type === "refund_form") {
           btn.textContent = "提交退款工单";
           // ch06:能退时 Agent 调 submit_refund 被拦成此动作,点开退款表单(订单号只读+原因下拉)
@@ -1020,8 +1020,12 @@
       successText: "工单已创建:", failureText: "工单创建失败,请稍后重试",
     };
 
-    function openTicketModal(triggerBtn) {
-      ticketForm.current = conversationFormOpening(triggerBtn);
+    function openTicketModal(triggerBtn, replyId) {
+      const opening = conversationFormOpening(triggerBtn);
+      if (opening.conversationId && Number.isSafeInteger(replyId) && replyId > 0) {
+        opening.ticketScope = opening.conversationId + ":" + replyId;
+      }
+      ticketForm.current = opening;
       ticketType.value = "";          // 不预选,强制用户选
       ticketDesc.value = "";          // 留空,用户自己写
       ticketErr.textContent = "";
@@ -1042,15 +1046,12 @@
       if (e.key === "Escape" && ticketMask.classList.contains("open")) closeTicketModal();
     });
 
-    const pendingSubmissions = new WeakMap();
+    const pendingTicketSubmissions = new Map();
+    const pendingButtonSubmissions = new WeakMap();
 
-    function submissionHeaders(button, body) {
-      const previous = pendingSubmissions.get(button);
-      const key = previous?.body === body ? previous.key :
-        Array.from(crypto.getRandomValues(new Uint8Array(16)),
-          n => n.toString(16).padStart(2, "0")).join("");
-      pendingSubmissions.set(button, { body, key });
-      return { "Content-Type": "application/json", "Idempotency-Key": key };
+    function newSubmissionKey() {
+      return Array.from(crypto.getRandomValues(new Uint8Array(16)),
+        n => n.toString(16).padStart(2, "0")).join("");
     }
 
     function conversationFormOpening(button) {
@@ -1061,20 +1062,38 @@
       const opening = form.current;
       if (!opening || opening.view !== historyRequest || opening.conversationId !== getConversationId()) return;
 
+      const body = JSON.stringify({conversation_id: opening.conversationId, ...fields});
+      const pending = opening.ticketScope ? pendingTicketSubmissions : pendingButtonSubmissions;
+      const scope = opening.ticketScope ?? opening.button;
+      const submission = pending.get(scope) ?? {keys: new Map(), inFlight: false};
+      if (submission.inFlight) {
+        form.error.textContent = "工单仍在提交，请稍后再试";
+        return;
+      }
+      const key = submission.keys.get(body) ?? newSubmissionKey();
+      submission.keys.set(body, key);
+      submission.inFlight = true;
+      pending.set(scope, submission);
+
       form.error.textContent = "";
       form.submit.disabled = true;
       form.submit.textContent = "提交中…";
       opening.button.disabled = true;
 
-      const body = JSON.stringify({conversation_id: opening.conversationId, ...fields});
-      const headers = submissionHeaders(opening.button, body);
+      const headers = {"Content-Type": "application/json", "Idempotency-Key": key};
       try {
         const response = await fetch(form.endpoint, {method: "POST", headers, body});
         if (!response.ok) throw new Error("submission failed");
         const {ticket_no} = await response.json();
-        pendingSubmissions.delete(opening.button);
+        if (typeof ticket_no !== "string" || !ticket_no) throw new Error("submission result missing");
+        const sameView = opening.view === historyRequest && opening.conversationId === getConversationId();
+        // A ticket accepted while its view is gone still needs to be reported on retry.
+        if (sameView || !opening.ticketScope) {
+          submission.keys.delete(body);
+          if (!submission.keys.size) pending.delete(scope);
+        }
         if (form.current === opening) form.close();
-        if (opening.view === historyRequest && opening.conversationId === getConversationId()) {
+        if (sameView) {
           addRow("bot").textContent = form.successText + ticket_no;
           messagesEl.scrollTop = messagesEl.scrollHeight;
         }
@@ -1084,6 +1103,8 @@
         form.error.textContent = form.failureText;
         form.submit.disabled = false;
         form.submit.textContent = form.submitText;
+      } finally {
+        submission.inFlight = false;
       }
     }
 
@@ -1371,7 +1392,7 @@
       }
       if (!textStarted) { ensureStructure(); textEl.textContent = "(无回复)"; }
       if (textStarted && citations.length) decorateCitations(textEl, citations);
-      if (actions.length) renderActions(bubble, actions);
+      if (actions.length) renderActions(bubble, actions, terminal.message_id);
       if (textStarted && !serviceFailed && terminal.message_id) addFeedbackBar(bubble, terminal.message_id);
     }
 
@@ -1482,7 +1503,7 @@
           bubble.appendChild(textEl);
           // Older replies have no stored action metadata.
           if (m.can_create_ticket ?? (m.content.trim() === REPLAY_TICKET_TEXT)) {
-            renderActions(bubble, [{type: "create_ticket"}]);
+            renderActions(bubble, [{type: "create_ticket"}], m.id);
           }
           if (!m.service_failed) addFeedbackBar(bubble, m.id, question);
         }
