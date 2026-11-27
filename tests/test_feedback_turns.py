@@ -6,6 +6,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph
+from pymilvus.exceptions import MilvusException
 from sqlalchemy import select
 
 from app.db.models import LowConfidenceQuestion
@@ -81,6 +82,100 @@ async def test_feedback_keeps_each_repeated_question_bound_to_its_reply(db_sessi
         assert [(row.raw_question, row.source, row.retrieved_chunks) for row in rows] == [
             (question, "user_feedback", evidence[1]), (question, "user_feedback", evidence[0]),
         ]
+
+async def test_refund_feedback_keeps_ranked_evidence_for_the_selected_reply(db_session_factory, monkeypatch):
+    def hit(chunk_id, answer, score):
+        return {"id": chunk_id, "question": "如何退货", "answer": answer,
+                "rerank_score": score, "section_path": "退款政策"}
+
+    def snapshot(chunk):
+        return {key: chunk[key] for key in ("question", "answer", "rerank_score", "section_path")}
+
+    initial = hit(101, "低分命中", 0.60)
+    best = hit(101, "签收后七天", 0.95)
+    second_best = hit(102, "需要保留包装", 0.85)
+    third_best = hit(103, "退款原路退回", 0.75)
+    later = hit(201, "特殊商品仅支持换货", 0.99)
+    results = iter(([initial, second_best], [best, third_best], [later], []))
+
+    async def resolve(query, history):
+        return query
+
+    async def classify(query, history):
+        return {"intent": "退款退货", "confidence": 0.95}
+
+    async def expand(query):
+        return [query, f"{query} 政策"]
+
+    async def search(*args, **kwargs):
+        try:
+            return next(results)
+        except StopIteration:
+            raise MilvusException(message="knowledge unavailable")
+
+    async def tool_specs():
+        return []
+
+    async def reply(messages):
+        return AIMessage(content="请查看这条退款政策。")
+
+    class Model:
+        def bind_tools(self, tools):
+            return RunnableLambda(reply)
+
+    async def skip_summary(cid):
+        pass
+
+    monkeypatch.setattr(nodes.coref, "resolve", resolve)
+    monkeypatch.setattr(nodes.intent_mod, "classify", classify)
+    monkeypatch.setattr(nodes.query_understanding, "expand_queries", expand)
+    monkeypatch.setattr(nodes.retrieval, "search_knowledge", search)
+    monkeypatch.setattr(nodes.registry, "get_all_specs", tool_specs)
+    monkeypatch.setattr(nodes, "get_chat_model", lambda **kwargs: Model())
+    monkeypatch.setattr(runtime.summarizer, "maybe_schedule_summary", skip_summary)
+    graph = build_graph(checkpointer=InMemorySaver())
+    monkeypatch.setattr(runtime, "get_graph", lambda: graph)
+
+    question = "订单1001可以退货吗"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        async def chat(conversation_id=None):
+            response = await client.post("/api/chat", json={
+                "conversation_id": conversation_id, "user_id": "u1", "message": question,
+            })
+            response.raise_for_status()
+            frames = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+            assert frames[-1]["event"] == "done"
+            citations = next((frame["items"] for frame in frames if frame.get("event") == "citations"), [])
+            return frames[-1], [(item["n"], item["id"], item["answer"]) for item in citations]
+
+        async def down(message_id):
+            response = await client.post("/api/feedback", json={
+                "conversation_id": cid, "message_id": message_id, "question": question, "rating": "down",
+            })
+            response.raise_for_status()
+            return response.json()["pooled"]
+
+        first, first_citations = await chat()
+        cid = first["conversation_id"]
+        second, second_citations = await chat(cid)
+        assert first_citations == [(1, 101, best["answer"]), (2, 103, third_best["answer"]),
+                                   (3, 102, second_best["answer"])]
+        assert second_citations == [(1, 201, later["answer"])]
+        assert first["message_id"] != second["message_id"]
+        assert await down(first["message_id"]) is True
+
+        failed, failed_citations = await chat(cid)
+        assert not failed_citations
+        assert await down(failed["message_id"]) is False
+
+    async with db_session_factory() as session:
+        rows = (await session.scalars(
+            select(LowConfidenceQuestion).where(LowConfidenceQuestion.conversation_id == cid)
+        )).all()
+        assert [(row.raw_question, row.source, row.retrieved_chunks) for row in rows] == [
+            (question, "user_feedback", [snapshot(best), snapshot(second_best), snapshot(third_best)]),
+        ]
+
 
 @pytest.mark.parametrize("resume", [False, True])
 async def test_stream_completion_matches_saved_agent_reply(resume, db_session_factory, monkeypatch):
