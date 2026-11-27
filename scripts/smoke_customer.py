@@ -23,7 +23,23 @@ _LOGISTICS_STATUS = {
     "DELIVERED": r"已签收|已送达",
 }
 
-_SEVEN_DAYS = r"(?:7\s*[天日]|七[天日])"
+_SEVEN_DAYS = r"(?:(?<!\d)7\s*[天日]|(?<![十百零])七[天日])"
+_RETURN_DEADLINE = rf"(?:自?签收(?:之?日)?[起后]\s*)?{_SEVEN_DAYS}(?:之?内)?"
+_NO_REASON_RETURN = r"无理由(?:申请)?退货"
+_RETURN_OFFER = re.compile(
+    rf"(?<![不未])(?:支持|提供|允许|可(?:以)?|享受)\s*(?:在\s*)?"
+    rf"(?:{_RETURN_DEADLINE}\s*)?(?:申请|办理|享受|发起)?\s*"
+    rf"(?:{_RETURN_DEADLINE}\s*)?{_NO_REASON_RETURN}"
+    rf"|{_NO_REASON_RETURN}(?:政策|规则|服务|条款)?\s*(?:仍然?|照常|继续)(?:有效|适用|提供|支持)"
+)
+_RETURN_DENIAL = (
+    r"(?:不再?(?:支持|提供|允许|适用|能|可|享受|执行|有效)|"
+    r"(?:已经|现已|已)?(?:被)?(?:取消|撤销|废止|作废|失效|停止|暂停|终止)(?:提供|执行)?)"
+)
+_REVOKED_RETURN = re.compile(
+    rf"(?<!未)(?<!没有){_RETURN_DENIAL}.{{0,16}}{_NO_REASON_RETURN}"
+    rf"|{_NO_REASON_RETURN}(?:政策|规则|服务|条款)?\s*{_RETURN_DENIAL}"
+)
 
 
 @dataclass
@@ -113,30 +129,45 @@ def _logistics_ok(reply: Reply) -> bool:
 
 
 def _states_return_rule(text: str) -> bool:
+    text = re.sub(r"[*`]", "", text)
     stated_rule = False
-    for sentence in re.split(r"[。；;！？\n]", text):
+    has_condition = re.search(r"(?<!不)完好|不影响二次销售", text) is not None
+    ineligible = r"(?:不完好|(?<![非不])(?:生鲜|定制|影响二次销售))"
+    admits = r"(?<!不)(?:支持|适用|可以|可享)"
+    for sentence in re.findall(r"[^。；;！？!?\n]+[？?]?", text):
+        if sentence.endswith(("？", "?")):
+            continue
         if "价保" in sentence and "无理由" not in sentence:
             continue
         # Detect contradictory eligibility even when it is stated in a separate sentence.
-        ineligible = r"(?:不完好|(?<![非不])(?:生鲜|定制|影响二次销售))"
-        admits = r"(?<!不)(?:支持|适用|可以|可享)"
-        for clause in re.split(r"[，,]", sentence):
+        clauses = re.split(r"[，,]", sentence)
+        for idx, clause in enumerate(clauses):
+            restricted = (
+                re.search(rf"{ineligible}|(?:超出|超过)\s*{_SEVEN_DAYS}|逾期", clause)
+                or (idx and re.fullmatch(r"(?:生鲜|定制)(?:类)?商品", clauses[idx - 1].strip()))
+            )
+            denied = _REVOKED_RETURN.search(clause)
+            if denied and not restricted:
+                return False
+            excluded = denied or re.search(r"除外|不适用|不支持|不享受|除.{0,20}以外", clause)
+            if excluded and re.search(ineligible, clause):
+                has_condition = True
             if (re.search(rf"{ineligible}.{{0,12}}{admits}", clause)
-                    and not re.search(r"除外|不适用|不支持|不享受|除.{0,20}以外", clause)):
+                    and not excluded):
                 return False
 
-        if not (re.search(_SEVEN_DAYS, sentence) and "无理由" in sentence and "退货" in sentence):
+        if not (re.search(_SEVEN_DAYS, sentence) and re.search(_NO_REASON_RETURN, sentence)):
             continue
         if re.search(rf"(?:满|超过){_SEVEN_DAYS}(?:后)?(?:才|仍|也)(?:能|可|支持)"
                      rf"|{_SEVEN_DAYS}后才(?:能|可|支持)", sentence):
             return False
-        for clause in re.split(r"[，,]", sentence):
+        for clause in clauses:
             if ("价保" not in clause and not re.search(r"不是|不从|不按", clause)
                     and re.search(rf"(?:下单|付款|发货).{{0,10}}(?:起算|[起后].{{0,5}}{_SEVEN_DAYS})", clause)):
                 return False
-        if not re.search(r"(?:不支持|不提供|不能|不可).{0,16}无理由", sentence):
+        if any(_RETURN_OFFER.search(clause) and not _REVOKED_RETURN.search(clause) for clause in clauses):
             stated_rule = True
-    return stated_rule and any(term in text for term in ("完好", "二次销售", "签收", "定制", "生鲜"))
+    return stated_rule and has_condition
 
 
 def _policy_ok(reply: Reply) -> bool:
