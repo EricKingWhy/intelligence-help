@@ -54,8 +54,12 @@ async def test_running_job_refuses_reentry(client, monkeypatch):
 @pytest.mark.parametrize("first_launch_fails", [False, True])
 async def test_job_refuses_reentry_during_startup(client, monkeypatch, tmp_path, first_launch_fails):
     name = "kb-preview"
-    monkeypatch.setitem(jobs._runs, name, jobs.JobRun())
+    monkeypatch.setitem(jobs._runs, name, jobs.JobRun(
+        status="ok", pid=111, started_at="2026-01-01T10:00:00",
+        finished_at="2026-01-01T10:01:00", returncode=0,
+    ))
     monkeypatch.setattr(jobs, "LOG_DIR", tmp_path)
+    (tmp_path / f"{name}.log").write_text("上一轮日志", encoding="utf-8")
     entered = asyncio.Event()
     release = asyncio.Event()
     launches = []
@@ -80,6 +84,8 @@ async def test_job_refuses_reentry_during_startup(client, monkeypatch, tmp_path,
     first = asyncio.create_task(client.post(url))
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
+        starting = (await asyncio.wait_for(client.get(url), timeout=2)).json()
+        listed = (await client.get("/api/jobs")).json()["jobs"]
         second = await asyncio.wait_for(client.post(url), timeout=2)
     finally:
         release.set()
@@ -87,13 +93,25 @@ async def test_job_refuses_reentry_during_startup(client, monkeypatch, tmp_path,
         if jobs._runs[name].watcher is not None:
             await jobs._runs[name].watcher
 
+    assert starting["status"] == "starting"
+    assert all(starting[key] is None for key in ("pid", "finished_at", "returncode"))
+    assert starting["started_at"] != "2026-01-01T10:00:00"
+    assert starting["log"].startswith("$ make kb-preview")
+    assert next(item for item in listed if item["name"] == name)["status"] == "starting"
     assert second.status_code == 409
     assert len(launches) == 1 and launches[0].closed
     assert response.status_code == (500 if first_launch_fails else 200)
     if first_launch_fails:
+        failed = (await client.get(url)).json()
+        assert failed["status"] == "failed" and failed["pid"] is None and failed["returncode"] is None
+        assert failed["finished_at"] and failed["log"] == starting["log"]
         assert (await client.post(url)).status_code == 200
         await jobs._runs[name].watcher
         assert len(launches) == 2
+
+    terminal = (await client.get(url)).json()
+    assert terminal["status"] == "ok" and terminal["pid"] == 4242 and terminal["returncode"] == 0
+    assert terminal["log"].startswith("$ make kb-preview")
 
 
 async def test_status_all_covers_registry(client):

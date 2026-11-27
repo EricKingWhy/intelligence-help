@@ -87,12 +87,11 @@ JOBS: dict[str, JobSpec] = {
 class JobRun:
     """一次运行的状态。进程对象与 watcher 任务留在内存,重启服务后归零——
     但产物里的 ran_at 与日志文件都在盘上,页面照样能说出「上次什么时候跑的、跑成什么样」。"""
-    status: str = "idle"          # idle | running | ok | failed | stopped
+    status: str = "idle"          # idle | starting | running | ok | failed | stopped
     pid: int | None = None
     started_at: str | None = None
     finished_at: str | None = None
     returncode: int | None = None
-    starting: bool = field(default=False, repr=False)
     log_revision: int = field(default=0, repr=False)
     proc: asyncio.subprocess.Process | None = field(default=None, repr=False)
     watcher: asyncio.Task | None = field(default=None, repr=False)
@@ -113,21 +112,24 @@ async def start(name: str) -> JobRun:
     """发起一次运行。同名作业启动中或尚未退出时拒绝重入。"""
     spec = JOBS[name]
     run = _run(name)
-    if run.starting:
+    if run.status == "starting":
         raise RuntimeError(f"{spec.title}正在启动中，请稍后再试")
     if run.status == "running" or run.proc is not None:
         raise RuntimeError(f"{spec.title}正在运行中(pid {run.pid}),等它跑完再发起")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = log_path(name)
-    header = (f"$ {' '.join(spec.argv)}\n"
-              f"# {dt.datetime.now().isoformat(timespec='seconds')} 由后台页发起\n\n")
-    path.write_text(header, encoding="utf-8")          # 每次覆盖:窗口里只看本次
+    started_at = dt.datetime.now().isoformat(timespec="seconds")
+    header = f"$ {' '.join(spec.argv)}\n# {started_at} 由后台页发起\n\n"
+    fh = path.open("w", encoding="utf-8", buffering=1)  # 窗口只显示本次日志
     run.log_revision += 1
-    fh = path.open("a", encoding="utf-8", buffering=1)
+    run.status, run.pid = "starting", None
+    run.started_at = started_at
+    run.finished_at = run.returncode = None
+    run.watcher = None
     # ponytail: 作业状态在单个服务进程内共享，多 worker 部署需要共享作业状态。
-    run.starting = True
     try:
+        fh.write(header)
         proc = await asyncio.create_subprocess_exec(
             *spec.argv, cwd=REPO_ROOT, stdout=fh, stderr=asyncio.subprocess.STDOUT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
@@ -135,14 +137,13 @@ async def start(name: str) -> JobRun:
             start_new_session=True,
         )
     except BaseException:
-        fh.close()
+        run.status = "failed"
+        run.finished_at = dt.datetime.now().isoformat(timespec="seconds")
+        with contextlib.suppress(OSError):
+            fh.close()
         raise
-    finally:
-        run.starting = False
 
     run.status, run.pid = "running", proc.pid
-    run.started_at = dt.datetime.now().isoformat(timespec="seconds")
-    run.finished_at = run.returncode = None
     run.proc = proc
     run.watcher = asyncio.create_task(_watch(name, run, proc, fh))
     logger.info("验收页发起作业 %s pid=%s argv=%s", name, proc.pid, " ".join(spec.argv))
