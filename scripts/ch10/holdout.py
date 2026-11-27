@@ -7,7 +7,7 @@ from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from app.core.taxonomy import LABEL2ID
+from app.core.taxonomy import ID2LABEL, LABEL2ID
 
 
 def load_jsonl(path):
@@ -22,32 +22,35 @@ def normalize(text):
     return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())
 
 
-def _valid_id(value: object) -> bool:
-    return isinstance(value, str) and bool(value) and value == value.strip()
+def _canonical_id(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return str(value) if type(value) is int else ''
 
 
 def audit(holdout, reference, threshold=0.9):
     reference_groups = set()
     reference_texts = set()
     for index, row in enumerate(reference, 1):
-        if not isinstance(row, dict) or not _valid_id(row.get("group_id")):
+        if not isinstance(row, dict) or not (group_id := _canonical_id(row.get("group_id"))):
             raise ValueError(f"Invalid reference group_id at row {index}")
         text = row.get("text")
         if not isinstance(text, str) or not (normalized := normalize(text)):
             raise ValueError(f"Invalid reference text at row {index}")
-        reference_groups.add(row["group_id"])
+        reference_groups.add(group_id)
         reference_texts.add(normalized)
 
     seen = set()
     for index, row in enumerate(holdout, 1):
         if (not isinstance(row, dict)
-                or not all(_valid_id(row.get(key)) for key in ("id", "group_id", "bucket"))
+                or not isinstance(row.get("bucket"), str) or not row["bucket"].strip()
                 or not isinstance(row.get("text"), str)):
             raise ValueError(f"Invalid holdout sample at row {index}")
         text = normalize(row["text"])
         labels = row.get("labels")
-        sample_id, group_id = row["id"], row["group_id"]
-        if sample_id in seen or not text:
+        sample_id = _canonical_id(row.get("id"))
+        group_id = _canonical_id(row.get("group_id"))
+        if not sample_id or sample_id in seen or not group_id or not text:
             raise ValueError(f"Invalid or duplicate holdout sample at row {index}")
         if (not isinstance(labels, list) or not labels
                 or any(not isinstance(label, str) or label not in LABEL2ID for label in labels)
@@ -61,6 +64,15 @@ def audit(holdout, reference, threshold=0.9):
             if SequenceMatcher(None, text, candidate, autojunk=False).ratio() >= threshold:
                 raise ValueError(f"Review near-duplicate reference sample for holdout row {index}")
         seen.add(sample_id)
+
+
+def validate_checkpoint(id_to_label, problem_type, threshold) -> None:
+    if id_to_label != ID2LABEL:
+        raise ValueError("Holdout checkpoint label order does not match the topic taxonomy")
+    if problem_type != "multi_label_classification":
+        raise ValueError("Holdout checkpoint must be a multi-label classifier")
+    if type(threshold) not in (int, float) or not 0 <= threshold <= 1:
+        raise ValueError("Holdout validation threshold must be a finite number in [0, 1]")
 
 
 def error_patterns(samples, probabilities, threshold, errors):

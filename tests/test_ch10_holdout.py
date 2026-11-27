@@ -1,5 +1,6 @@
 import pytest
 
+from app.core.taxonomy import ID2LABEL
 from scripts.ch10 import holdout
 from scripts.ch10.holdout import audit
 
@@ -11,11 +12,13 @@ def test_holdout_audit_rejects_cross_split_overlap():
     audit([sample], train)
     with pytest.raises(ValueError, match="overlaps"):
         audit([{**sample, "group_id": "train-1"}], train)
+    with pytest.raises(ValueError, match="overlaps"):
+        audit([{**sample, "group_id": " 123 "}], [{**train[0], "group_id": 123}])
     with pytest.raises(ValueError, match="near-duplicate"):
         audit([{**sample, "text": "这个商品如何开电子增值税发票"}], train)
 
 
-@pytest.mark.parametrize("group_id", ["   ", 123, None])
+@pytest.mark.parametrize("group_id", ["   ", True, None])
 def test_holdout_rejects_unusable_reference_group_ids(group_id):
     train = [{"group_id": group_id, "text": "这个商品如何开增值税发票"}]
     sample = {"id": "sample-1", "group_id": "real-1", "bucket": "logistics",
@@ -46,3 +49,18 @@ def test_holdout_report_separates_low_confidence_and_multi_intent_errors():
             {"missed": "订单修改", "extra": "物流", "count": 1},
         ],
     }
+
+
+def test_holdout_requires_canonical_checkpoint_label_order():
+    holdout.validate_checkpoint(ID2LABEL, "multi_label_classification", 0.45)
+    swapped = {**ID2LABEL, 0: ID2LABEL[1], 1: ID2LABEL[0]}
+    with pytest.raises(ValueError, match="label order"):
+        holdout.validate_checkpoint(swapped, "multi_label_classification", 0.45)
+    with pytest.raises(ValueError, match="multi-label"):
+        holdout.validate_checkpoint(ID2LABEL, "single_label_classification", 0.45)
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), -0.1, 1.1, "0.45", True])
+def test_holdout_rejects_invalid_validation_threshold(threshold):
+    with pytest.raises(ValueError, match="threshold"):
+        holdout.validate_checkpoint(ID2LABEL, "multi_label_classification", threshold)

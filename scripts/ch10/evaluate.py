@@ -15,6 +15,7 @@ from sklearn.metrics import multilabel_confusion_matrix, precision_recall_fscore
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from app.core.taxonomy import LABEL2ID, NUM_CLASSES, SEVERITY, TOPIC_NAMES
+from scripts.ch10.holdout import error_patterns, validate_checkpoint
 from scripts.ch10.inference_lib import apply_threshold
 
 MODEL_DIR = pathlib.Path("data/ch10/model")
@@ -45,6 +46,8 @@ def main(*, samples=None, reports=REPORTS, dataset_metadata=None, model_dir=MODE
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True).to(device)
     threshold = json.loads((model_dir / "threshold.json").read_text(encoding="utf-8"))["threshold"]
+    if dataset_metadata is not None:
+        validate_checkpoint(model.config.id2label, model.config.problem_type, threshold)
     if samples is None:
         samples = [json.loads(l) for l in TEST.read_text(encoding="utf-8").splitlines() if l.strip()]
     texts = [s["text"] for s in samples]
@@ -133,8 +136,6 @@ def main(*, samples=None, reports=REPORTS, dataset_metadata=None, model_dir=MODE
     if dataset_metadata:
         from collections import Counter
 
-        from scripts.ch10.holdout import error_patterns
-
         report["dataset"] = dataset_metadata
         report["buckets"] = {}
         for bucket in sorted({s["bucket"] for s in samples}):
@@ -146,8 +147,12 @@ def main(*, samples=None, reports=REPORTS, dataset_metadata=None, model_dir=MODE
                 )[2]) for average in ("micro", "macro")},
             }
         baseline = json.loads((REPORTS / "eval_report.json").read_text(encoding="utf-8"))
-        report["baseline_f1_delta"] = {average: report[average]["f1"] - baseline[average]["f1"]
-                                       for average in ("micro", "macro")}
+        report["baseline_threshold"] = baseline["threshold"]
+        report["baseline_f1_delta"] = None
+        if threshold == baseline["threshold"]:
+            report["baseline_f1_delta"] = {
+                average: report[average]["f1"] - baseline[average]["f1"] for average in ("micro", "macro")
+            }
         report["missed_labels"] = Counter(label for error in errors for label in error["missed"])
         report["extra_labels"] = Counter(label for error in errors for label in error["extra"])
         report["error_patterns"] = patterns = error_patterns(samples, probabilities, threshold, errors)
@@ -155,7 +160,11 @@ def main(*, samples=None, reports=REPORTS, dataset_metadata=None, model_dir=MODE
             cls["limited_support"] = cls["support"] < 10
         lines += ["", "## 真实留出集", "",
                   f"版本 {dataset_metadata['version']}。每类少于 10 条正例时，指标需结合样本数解释。",
-                  f"对既有报告的 F1 差异 {report['baseline_f1_delta']}。"]
+                  f"既有报告的阈值为 {baseline['threshold']}。"]
+        if report["baseline_f1_delta"] is None:
+            lines.append("两次阈值不同，省略直接 F1 差值。")
+        else:
+            lines.append(f"对既有报告的 F1 差异 {report['baseline_f1_delta']}。")
         lines += ["", "| 场景 | 样本数 | 错例数 |", "|---|---|---|"]
         for key, label in (("low_confidence", "所有标签均低于阈值"), ("multi_intent", "人工标注多个主题")):
             pattern = patterns[key]
