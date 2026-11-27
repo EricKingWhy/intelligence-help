@@ -8,8 +8,9 @@
 仓库 Makefile 里真有的目标,免得页面按钮指向一个不存在的配方。
 """
 import asyncio
-import re
 import pathlib
+import re
+import threading
 
 import pytest
 from fastapi import FastAPI
@@ -107,3 +108,159 @@ def test_every_job_target_exists_in_makefile():
     targets = set(re.findall(r"^([a-zA-Z0-9_.-]+):", text, re.MULTILINE))
     missing = [spec.argv[1] for spec in jobs.JOBS.values() if spec.argv[1] not in targets]
     assert not missing, f"作业指向的 make 目标不存在:{missing}"
+
+
+async def test_log_poll_preserves_small_log_and_appends(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(jobs, "LOG_DIR", tmp_path)
+    url = "/api/jobs/kb-preview"
+    path = tmp_path / "kb-preview.log"
+
+    missing = (await client.get(url)).json()
+    assert missing["log"] == "" and missing["log_mtime"] is None
+
+    path.touch()
+    assert (await client.get(url)).json()["log"] == ""
+    path.write_bytes("准备完成\r\n正在".encode())
+    assert (await client.get(url)).json()["log"] == "准备完成\n正在"
+
+    with path.open("ab") as log:
+        log.write("处理\n最后一行".encode())
+    assert (await client.get(url)).json()["log"] == "准备完成\n正在处理\n最后一行"
+
+
+async def test_log_poll_reads_at_most_256_kib(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(jobs, "LOG_DIR", tmp_path)
+    path = tmp_path / "kb-preview.log"
+    with path.open("wb") as log:
+        log.write(b"old\n" * (1024 * 512))
+        log.write("界".encode() * (1024 * 128))
+        log.write("未完".encode())
+
+    original_open = pathlib.Path.open
+    sizes = []
+
+    class CountingFile:
+        def __init__(self, file):
+            self.file = file
+
+        def __enter__(self):
+            self.file.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.file.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.file, name)
+
+        def read(self, size=-1):
+            data = self.file.read(size)
+            sizes.append(len(data.encode("utf-8")) if isinstance(data, str) else len(data))
+            return data
+
+    def open_log(file_path, *args, **kwargs):
+        file = original_open(file_path, *args, **kwargs)
+        return CountingFile(file) if file_path == path else file
+
+    monkeypatch.setattr(pathlib.Path, "open", open_log)
+    response = await client.get("/api/jobs/kb-preview")
+    assert response.status_code == 200
+    assert 0 < sum(sizes) <= 256 * 1024
+    tail = response.json()["log"]
+    assert tail.startswith("界") and tail.endswith("未完") and "�" not in tail
+
+
+async def test_job_log_keeps_latest_400_lines(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(jobs, "LOG_DIR", tmp_path)
+    rows = [f"进度 {i}" for i in range(450)]
+    (tmp_path / "kb-preview.log").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    response = await client.get("/api/jobs/kb-preview")
+    assert response.json()["log"] == "\n".join(rows[-400:])
+
+
+async def test_job_polls_leave_event_loop_available(app, client, monkeypatch, tmp_path):
+    monkeypatch.setattr(jobs, "LOG_DIR", tmp_path)
+    path = tmp_path / "kb-preview.log"
+    path.write_text("正在运行", encoding="utf-8")
+    original_open = pathlib.Path.open
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    blocked = threading.Event()
+
+    @app.get("/ready")
+    async def ready():
+        return {"ready": True}
+
+    def open_log(file_path, *args, **kwargs):
+        if file_path == path:
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(2):
+                blocked.set()
+                # Let the old synchronous path fail promptly rather than blocking all polls.
+                release.set()
+        return original_open(file_path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "open", open_log)
+    polls = [asyncio.create_task(client.get("/api/jobs/kb-preview")) for _ in range(4)]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=3)
+        response = await asyncio.wait_for(client.get("/ready"), timeout=1)
+        assert response.json() == {"ready": True}
+        assert not blocked.is_set()
+        assert any(not poll.done() for poll in polls)
+    finally:
+        release.set()
+        responses = await asyncio.gather(*polls)
+    assert all(response.json()["log"] == "正在运行" for response in responses)
+
+
+async def test_poll_does_not_pair_new_log_with_previous_run(client, monkeypatch, tmp_path):
+    name = "kb-preview"
+    monkeypatch.setattr(jobs, "LOG_DIR", tmp_path)
+    monkeypatch.setitem(jobs._runs, name, jobs.JobRun(status="ok", pid=111))
+    path = tmp_path / f"{name}.log"
+    path.write_text("上一轮", encoding="utf-8")
+    url = f"/api/jobs/{name}"
+    original_open = pathlib.Path.open
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+
+    def open_log(file_path, mode="r", *args, **kwargs):
+        if file_path == path and mode == "rb" and not release.is_set():
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(3)
+        return original_open(file_path, mode, *args, **kwargs)
+
+    class Process:
+        pid = 222
+
+        async def wait(self):
+            return 0
+
+    async def launch(*args, **kwargs):
+        return Process()
+
+    monkeypatch.setattr(pathlib.Path, "open", open_log)
+    monkeypatch.setattr(jobs.asyncio, "create_subprocess_exec", launch)
+    poll = asyncio.create_task(client.get(url))
+    start = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        start = asyncio.create_task(client.post(url))
+        # Wait for the new run to replace the file before letting either reader proceed.
+        async with asyncio.timeout(2):
+            while jobs._runs[name].pid != 222:
+                await asyncio.sleep(0)
+    finally:
+        release.set()
+        response = await poll
+        if start is not None:
+            await start
+            await jobs._runs[name].watcher
+
+    assert response.json()["pid"] == 222
+    assert response.json()["log"] == ""
+    current = (await client.get(url)).json()
+    assert current["log"].startswith("$ make kb-preview")

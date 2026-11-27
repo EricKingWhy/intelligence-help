@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO_ROOT / "log" / "acceptance"
-TAIL_LINES = 400        # 回显窗口上限:日志文件只读尾部,训练几万行也不撑爆响应
+TAIL_LINES = 400
+TAIL_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ class JobRun:
     finished_at: str | None = None
     returncode: int | None = None
     starting: bool = field(default=False, repr=False)
+    log_revision: int = field(default=0, repr=False)
     proc: asyncio.subprocess.Process | None = field(default=None, repr=False)
     watcher: asyncio.Task | None = field(default=None, repr=False)
 
@@ -121,6 +123,7 @@ async def start(name: str) -> JobRun:
     header = (f"$ {' '.join(spec.argv)}\n"
               f"# {dt.datetime.now().isoformat(timespec='seconds')} 由后台页发起\n\n")
     path.write_text(header, encoding="utf-8")          # 每次覆盖:窗口里只看本次
+    run.log_revision += 1
     fh = path.open("a", encoding="utf-8", buffering=1)
     # ponytail: 作业状态在单个服务进程内共享，多 worker 部署需要共享作业状态。
     run.starting = True
@@ -177,30 +180,60 @@ async def stop(name: str) -> None:
 
 
 def tail(name: str, lines: int = TAIL_LINES) -> str:
-    path = log_path(name)
-    if not path.exists():
+    try:
+        with log_path(name).open("rb", buffering=0) as log:
+            end = log.seek(0, os.SEEK_END)
+            start = max(0, end - TAIL_BYTES)
+            log.seek(start)
+            data = log.read(end - start)
+    except FileNotFoundError:
         return ""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    rows = text.splitlines()
-    return "\n".join(rows[-lines:])
+
+    if start:
+        # The byte limit can start in the middle of a UTF-8 character.
+        first = 0
+        while first < min(3, len(data)) and data[first] & 0b11000000 == 0b10000000:
+            first += 1
+        data = data[first:]
+    return "\n".join(data.decode("utf-8", errors="replace").splitlines()[-lines:])
 
 
-def status(name: str, with_log: bool = False) -> dict:
+def _run_status(name: str) -> dict:
     spec, run = JOBS[name], _run(name)
-    path = log_path(name)
-    out = {
+    return {
         "name": name, "title": spec.title, "cmd": " ".join(spec.argv),
         "needs": spec.needs, "heavy": spec.heavy,
         "status": run.status, "pid": run.pid,
         "started_at": run.started_at, "finished_at": run.finished_at,
         "returncode": run.returncode,
-        # 服务重启后内存状态归零,但日志文件的 mtime 还在:据此告知「上次跑过,时间是…」
-        "log_mtime": (dt.datetime.fromtimestamp(path.stat().st_mtime)
-                      .isoformat(timespec="seconds") if path.exists() else None),
     }
+
+
+def _log_status(name: str, with_log: bool) -> dict:
+    try:
+        mtime = log_path(name).stat().st_mtime
+    except FileNotFoundError:
+        mtime = None
+    # 作业状态重启后归零时，文件修改时间仍可用于显示上次运行时间。
+    out = {"log_mtime": dt.datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+           if mtime is not None else None}
     if with_log:
         out["log"] = tail(name)
     return out
+
+
+def status(name: str, with_log: bool = False) -> dict:
+    return _run_status(name) | _log_status(name, with_log)
+
+
+async def status_with_log(name: str) -> dict:
+    run = _run(name)
+    revision = run.log_revision
+    log = await asyncio.to_thread(_log_status, name, True)
+    if revision != run.log_revision:
+        # A new run replaced the file during the read. The next poll will show its log.
+        log = {"log_mtime": None, "log": ""}
+    return _run_status(name) | log
 
 
 def status_all() -> list[dict]:
