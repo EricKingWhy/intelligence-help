@@ -68,7 +68,7 @@ function scoreCell(v, redLine) {
 }
 
 const STATUS_LABEL = {
-  idle: "未跑过", running: "运行中", ok: "已完成", failed: "失败", stopped: "已停止",
+  idle: "未跑过", starting: "启动中", running: "运行中", ok: "已完成", failed: "失败", stopped: "已停止",
 };
 
 /* 日志尾缓存:作业跑完会回调页面重新取数,取数把按钮和日志窗口整个重建。
@@ -84,39 +84,50 @@ const JOB_LOGS = {};
 function jobButton(spec, logbox, onFinish) {
   const btn = el("button", "btn sm go", "重跑 " + spec.title);
   btn.title = spec.cmd + (spec.needs && spec.needs !== "—" ? "(" + spec.needs + ")" : "");
-  let timer = null;
+  const isActive = (status) => status === "starting" || status === "running";
 
   function paint(st) {
-    const running = st.status === "running";
-    btn.disabled = running;
-    btn.textContent = running
-      ? "运行中… " + spec.title
+    const active = isActive(st.status);
+    btn.disabled = active;
+    btn.textContent = active
+      ? STATUS_LABEL[st.status] + "… " + spec.title
       : (st.status === "idle" ? "重跑 " : "再跑一次 ") + spec.title;
     if (st.log) {
       JOB_LOGS[spec.name] = st.log;
       showLog(st.log);
+    } else if (active || st.log === "") {
+      delete JOB_LOGS[spec.name];
+      if (active) showLog(STATUS_LABEL[st.status] + "…");
+      else if (logbox.dataset.jobName === spec.name) {
+        logbox.classList.remove("on");
+        logbox.textContent = "";
+      }
     }
   }
 
   function showLog(text) {
+    logbox.dataset.jobName = spec.name;
     logbox.classList.add("on");
     logbox.textContent = text;
     logbox.scrollTop = logbox.scrollHeight;
   }
 
+  function update(st) {
+    paint(st);
+    if (isActive(st.status)) {
+      setTimeout(poll, 1200);
+      return;
+    }
+    toast(spec.title + "：" + STATUS_LABEL[st.status]
+      + (st.returncode !== null ? "(退出码 " + st.returncode + ")" : ""),
+      st.status !== "ok");
+    if (onFinish) onFinish();
+  }
+
   async function poll() {
     try {
-      const st = await api("/api/jobs/" + spec.name);
-      paint(st);
-      if (st.status !== "running") {
-        clearInterval(timer); timer = null;
-        toast(spec.title + "：" + STATUS_LABEL[st.status]
-          + (st.returncode !== null ? "(退出码 " + st.returncode + ")" : ""),
-          st.status !== "ok");
-        if (onFinish) onFinish();
-      }
+      update(await api("/api/jobs/" + spec.name));
     } catch (e) {
-      clearInterval(timer); timer = null;
       toast("轮询失败：" + e.message, true);
     }
   }
@@ -127,23 +138,20 @@ function jobButton(spec, logbox, onFinish) {
       + (spec.needs && spec.needs !== "—" ? "前置：" + spec.needs + "\n" : "")
       + "确认现在跑？")) return;
     btn.disabled = true;
-    logbox.classList.add("on");
-    logbox.textContent = "发起中…";
+    showLog("发起中…");
     try {
-      const st = await api("/api/jobs/" + spec.name, { method: "POST" });
-      paint(st);
-      timer = setInterval(poll, 1200);
+      update(await api("/api/jobs/" + spec.name, { method: "POST" }));
     } catch (e) {
       btn.disabled = false;
-      logbox.textContent = "发起失败：" + e.message;
+      showLog("发起失败：" + e.message);
       toast("发起失败：" + e.message, true);
     }
   });
 
   paint(spec);
   if (JOB_LOGS[spec.name]) showLog(JOB_LOGS[spec.name]);   // 重建后把日志贴回去
-  // 页面打开时作业正在跑(上一个标签页发起的):直接接上轮询,别让它看着像卡住
-  if (spec.status === "running") timer = setInterval(poll, 1200);
+  // 接上其他标签页已发起的作业，包括尚未拿到 PID 的阶段。
+  if (isActive(spec.status)) setTimeout(poll, 1200);
   return btn;
 }
 
