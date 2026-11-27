@@ -2,9 +2,15 @@
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
+
+# Allow the documented module command and direct execution from a checkout.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.tools.business import order_snapshot
 from mcp_servers.logistics_server import logistics_snapshot
@@ -16,6 +22,8 @@ _LOGISTICS_STATUS = {
     "DELIVERING": r"派送中|正在派送|正在配送",
     "DELIVERED": r"已签收|已送达",
 }
+
+_SEVEN_DAYS = r"(?:7\s*[天日]|七[天日])"
 
 
 @dataclass
@@ -96,25 +104,35 @@ def _logistics_ok(reply: Reply) -> bool:
     expected = logistics_snapshot(order_snapshot("1001")["tracking_no"])["status_code"]
     if not {"query_order", "query_logistics"} <= reply.tools or "retry_turn" in reply.actions:
         return False
+    reported = set()
     for clause in re.split(r"[，,。；;！？\n]", reply.answer):
-        if (re.search(_LOGISTICS_STATUS[expected], clause)
-                and not re.search(r"无法|查不到|查无|超时|暂不可用|是否|不确定|还没|未|不是|不在|没有", clause)):
-            return True
-    return False
+        if re.search(r"无法|查不到|查无|超时|暂不可用|是否|不确定|还没|未|不是|不在|没有|预计|历史", clause):
+            continue
+        reported.update(code for code, pattern in _LOGISTICS_STATUS.items() if re.search(pattern, clause))
+    return reported == {expected}
 
 
 def _states_return_rule(text: str) -> bool:
     stated_rule = False
     for sentence in re.split(r"[。；;！？\n]", text):
-        if not (re.search(r"(?:7\s*[天日]|七[天日])", sentence) and "无理由" in sentence and "退货" in sentence):
+        if "价保" in sentence and "无理由" not in sentence:
             continue
-        # The demo policy excludes these categories. An explicit exception can accompany the rule.
-        if (re.search(r"(?<!非)(?:生鲜|定制).{0,12}(?:也|同样|都|均)?(?:支持|适用|可以|可享)", sentence)
-                and not re.search(r"除外|不适用|不支持|不享受|除.{0,20}以外", sentence)):
+        # Detect contradictory eligibility even when it is stated in a separate sentence.
+        ineligible = r"(?:不完好|(?<![非不])(?:生鲜|定制|影响二次销售))"
+        admits = r"(?:也|同样|都|均)?(?:支持|适用|可以|可享)"
+        for clause in re.split(r"[，,]", sentence):
+            if (re.search(rf"{ineligible}.{{0,12}}{admits}", clause)
+                    and not re.search(r"除外|不适用|不支持|不享受|除.{0,20}以外", clause)):
+                return False
+
+        if not (re.search(_SEVEN_DAYS, sentence) and "无理由" in sentence and "退货" in sentence):
+            continue
+        if re.search(rf"(?:满|超过){_SEVEN_DAYS}(?:后)?(?:才|仍|也)(?:能|可|支持)"
+                     rf"|{_SEVEN_DAYS}后才(?:能|可|支持)", sentence):
             return False
         for clause in re.split(r"[，,]", sentence):
             if ("价保" not in clause and not re.search(r"不是|不从|不按", clause)
-                    and re.search(r"(?:下单|付款).{0,10}(?:[起后].{0,5}(?:7\s*天|七天)|起算)", clause)):
+                    and re.search(rf"(?:下单|付款|发货).{{0,10}}(?:起算|[起后].{{0,5}}{_SEVEN_DAYS})", clause)):
                 return False
         if not re.search(r"(?:不支持|不提供|不能|不可).{0,16}无理由", sentence):
             stated_rule = True
