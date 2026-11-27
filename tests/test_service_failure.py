@@ -26,14 +26,23 @@ from app.main import app
         ("faq_check", "超时", {"stage": "evidence_check", "kind": "timeout"}),
         ("faq_deadline", "超时", {"stage": "faq_tool", "kind": "timeout"}),
         ("faq_after_write", "确认原工单状态", {"stage": "faq_tool", "kind": "timeout"}),
+        ("faq_milvus", "知识库暂时无法查询", {"stage": "faq_retrieval", "kind": "knowledge_unavailable"}),
+        ("faq_limit", "繁忙", {"stage": "faq_retrieval", "kind": "rate_limited"}),
+        ("faq_fallback_milvus", "知识库暂时无法查询", {"stage": "faq_retrieval", "kind": "knowledge_unavailable"}),
+        ("faq_fallback_limit", "繁忙", {"stage": "faq_retrieval", "kind": "rate_limited"}),
+        ("faq_retrieval_after_write", "确认原工单状态", {"stage": "faq_retrieval", "kind": "knowledge_unavailable"}),
     ],
 )
 async def test_service_failure_recovers_without_polluting_knowledge_queue(
     scenario, answer, diagnosis, db_session_factory, monkeypatch,
 ):
-    after_write = scenario == "faq_after_write"
-    faq_deadline = scenario in {"faq_deadline", "faq_after_write"}
-    uses_faq = scenario == "faq_check" or faq_deadline
+    after_write = scenario.endswith("_after_write")
+    faq_deadline = diagnosis["stage"] == "faq_tool"
+    faq_retrieval = diagnosis["stage"] == "faq_retrieval"
+    uses_faq = scenario.startswith("faq_")
+    faq_fallback = scenario.startswith("faq_fallback_")
+    category = "商品规格" if faq_fallback else None
+    searches = []
 
     async def same_question(query, history):
         return query
@@ -41,7 +50,7 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
     async def classify(query, history):
         return {"intent": "物流" if uses_faq or scenario == "timeout" else "商品咨询", "confidence": 0.95}
 
-    async def reject_model(_):
+    async def raise_rate_limit(_):
         response = httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"))
         response.raise_for_status()
 
@@ -60,8 +69,12 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
             nonlocal model_calls
             model_calls += 1
             if uses_faq:
-                assert model_calls == 1, "FAQ service failures should bypass further model calls"
-                calls = [{"name": "query_faq", "id": "faq", "args": {"keyword": "猫砂盆保修多久"}}]
+                if model_calls > 1:
+                    return AIMessage(content="没有查到政策。")
+                args = {"keyword": "猫砂盆保修多久"}
+                if category:
+                    args["category"] = category
+                calls = [{"name": "query_faq", "id": "faq", "args": args}]
                 if after_write:
                     calls.insert(0, {"name": "create_ticket", "id": "create", "args": {
                         "ticket_type": "咨询", "description": "请帮我核对保修期",
@@ -72,8 +85,13 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
                 return AIMessage(content="我先查一下", tool_calls=calls)
             raise TimeoutError()
 
-    async def hits(query, **kwargs):
-        if scenario == "milvus":
+    async def hits(query, *, category=None, **kwargs):
+        searches.append(category)
+        if faq_fallback and category:
+            return []
+        if faq_retrieval and diagnosis["kind"] == "rate_limited":
+            await raise_rate_limit(query)
+        if scenario == "milvus" or faq_retrieval:
             raise MilvusException(message="fixture Milvus unavailable")
         return [{"id": 17, "question": "猫砂盆保修", "answer": "保修一年",
                  "rerank_score": 0.95, "section_path": "政策 / 保修", "content_type": "policy"}]
@@ -92,7 +110,7 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
 
     monkeypatch.setattr(nodes.coref, "resolve", same_question)
     if scenario == "limit":
-        monkeypatch.setattr(nodes.intent_mod.llm, "structured", lambda *a, **k: RunnableLambda(reject_model))
+        monkeypatch.setattr(nodes.intent_mod.llm, "structured", lambda *a, **k: RunnableLambda(raise_rate_limit))
     else:
         monkeypatch.setattr(nodes.intent_mod, "classify", classify)
     monkeypatch.setattr(nodes, "get_chat_model", lambda **kwargs: Model())
@@ -121,6 +139,9 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
             assert response.is_success
             events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
         assert any(event.get("replace") and answer in event["delta"] for event in events)
+        if uses_faq:
+            assert model_calls == 1
+            assert searches == ([category, None] if faq_fallback else [None])
         actions = next(event["items"] for event in events if event.get("event") == "actions")
         expected_actions = ["transfer_human"] if after_write else ["retry_turn", "transfer_human"]
         assert [action["type"] for action in actions] == expected_actions
@@ -145,8 +166,9 @@ async def test_service_failure_recovers_without_polluting_knowledge_queue(
                     select(ToolAuditLog).where(ToolAuditLog.tool_name == "query_faq")
                 )).one()
                 assert audit.tool_name == "query_faq"
-                assert audit.status == "超时"
-                assert audit.error_message == f"{diagnosis['stage']}:timeout"
+                kind = diagnosis["kind"]
+                assert audit.status == ("超时" if kind == "timeout" else "失败")
+                assert audit.error_message == f"{diagnosis['stage']}:{kind}"
                 assert audit.retry_count == 0
         messages = await client.get(f"/api/conversations/{cid}/messages")
         assert messages.json()["items"][-1]["service_failed"] is True
