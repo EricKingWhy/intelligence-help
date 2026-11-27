@@ -106,6 +106,7 @@ async def retrieve_policy(state) -> dict:
     ranked = sorted(merged.values(), key=lambda h: h["rerank_score"], reverse=True)
     evidence, citations = retrieval.format_evidence(ranked)
     return {"evidence": evidence, "citations": citations,
+            "retrieved_snapshot": snapshot_from_hits(ranked),
             "trace": {"retrieve_policy": {"queries": queries, "hits": len(ranked)}}}
 
 
