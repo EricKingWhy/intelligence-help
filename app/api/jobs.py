@@ -33,13 +33,13 @@ async def job_start(name: str) -> dict:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=f"命令起不来:{e}") from e
-    return jobs.status(name, with_log=True)
+    return await jobs.status_with_log(name)
 
 
 @router.get("/{name}")
 async def job_status(name: str) -> dict:
     _known(name)
-    return jobs.status(name, with_log=True)
+    return await jobs.status_with_log(name)
 
 
 @router.post("/{name}/stop")
@@ -49,4 +49,4 @@ async def job_stop(name: str) -> dict:
         await jobs.stop(name)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    return jobs.status(name, with_log=True)
+    return await jobs.status_with_log(name)
