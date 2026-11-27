@@ -46,10 +46,15 @@ def run_smoke(monkeypatch, responses):
     smoke_customer.main()
 
 
-def test_valid_demo_replies_pass_with_final_text_and_legacy_replacement(monkeypatch, capsys):
+@pytest.mark.parametrize("policy_text", [
+    POLICY[1]["delta"],
+    "签收后七天内支持无理由退货，商品需完好。生鲜商品不可以无理由退货。[1]",
+    "签收后七天内支持无理由退货，商品需完好。定制商品不可享受无理由退货。[1]",
+])
+def test_valid_demo_replies_pass_with_final_text_and_legacy_replacement(monkeypatch, capsys, policy_text):
     responses = [
         wire([*LOGISTICS[:2], {"delta": "处理中"}, {"delta": "快递已揽收。", "replace": True}]),
-        wire([POLICY[0], {"delta": "旧草稿"}], final_text=POLICY[1]["delta"]),
+        wire([POLICY[0], {"delta": "旧草稿"}], final_text=policy_text),
         wire(REFUSAL),
     ]
     run_smoke(monkeypatch, responses)

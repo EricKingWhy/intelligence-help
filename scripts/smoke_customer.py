@@ -119,7 +119,7 @@ def _states_return_rule(text: str) -> bool:
             continue
         # Detect contradictory eligibility even when it is stated in a separate sentence.
         ineligible = r"(?:不完好|(?<![非不])(?:生鲜|定制|影响二次销售))"
-        admits = r"(?:也|同样|都|均)?(?:支持|适用|可以|可享)"
+        admits = r"(?<!不)(?:支持|适用|可以|可享)"
         for clause in re.split(r"[，,]", sentence):
             if (re.search(rf"{ineligible}.{{0,12}}{admits}", clause)
                     and not re.search(r"除外|不适用|不支持|不享受|除.{0,20}以外", clause)):
