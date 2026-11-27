@@ -544,33 +544,53 @@ async def list_review_candidates(limit: int = 200) -> list[dict]:
         return [{"id": r.id, "normalized_question": r.normalized_question} for r in result]
 
 
-async def insert_review_item(normalized_question: str, ai_suggested_answer: str | None) -> int:
-    async with db.async_session() as s:
+def _transaction_or_session(session: AsyncSession | None):
+    return db.async_session.begin() if session is None else nullcontext(session)
+
+
+async def insert_review_item(
+    normalized_question: str, ai_suggested_answer: str | None, *, session: AsyncSession | None = None,
+) -> int:
+    async with _transaction_or_session(session) as s:
         row = ReviewQueue(normalized_question=normalized_question,
                           ai_suggested_answer=ai_suggested_answer)
         s.add(row)
-        await s.commit()
+        await s.flush()
         return row.id
 
 
-async def increment_occurrence(review_id: int) -> None:
-    """查重命中:只累加次数,状态不动(命中已驳回/已通过也一样——驳回即终审)。
-    原子 UPDATE,不走读改写,两批飞轮重叠时不丢计数。"""
-    async with db.async_session() as s:
+async def increment_occurrence(review_id: int, *, session: AsyncSession | None = None) -> None:
+    """查重命中只原子累加次数，保留候选状态。"""
+    async with _transaction_or_session(session) as s:
         await s.execute(
             update(ReviewQueue)
             .where(ReviewQueue.id == review_id)
             .values(occurrence_count=ReviewQueue.occurrence_count + 1)
         )
-        await s.commit()
 
 
-async def set_matched_review(lcq_id: int, review_id: int) -> None:
-    async with db.async_session() as s:
+async def set_matched_review(lcq_id: int, review_id: int, *, session: AsyncSession | None = None) -> None:
+    async with _transaction_or_session(session) as s:
         row = await s.get(LowConfidenceQuestion, lcq_id)
         if row is not None:
             row.matched_review_id = review_id
-            await s.commit()
+
+
+async def match_unhandled_question(
+    lcq_id: int, normalized_question: str, ai_suggested_answer: str | None, matched_review_id: int | None,
+) -> int | None:
+    """Commit the candidate change and source cursor together, once per source."""
+    async with db.async_session.begin() as session:
+        source = await session.get(LowConfidenceQuestion, lcq_id, with_for_update=True)
+        if source is None or source.matched_review_id is not None:
+            return None
+        if matched_review_id is None:
+            review_id = await insert_review_item(normalized_question, ai_suggested_answer, session=session)
+        else:
+            review_id = matched_review_id
+            await increment_occurrence(review_id, session=session)
+        await set_matched_review(lcq_id, review_id, session=session)
+        return review_id
 
 
 async def list_review_queue(status: str | None) -> list[ReviewQueue]:

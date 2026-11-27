@@ -179,13 +179,14 @@ async def execute_tool_call(
     else:
         retries = settings.tool_max_retries if spec.max_retries is None else spec.max_retries
     tool_timeout = _timeout_of(spec)
+    builtin_faq = name == "query_faq" and spec.source == "builtin"
     attempt = 0
     while True:
         try:
             result = await asyncio.wait_for(spec.tool.ainvoke(args), timeout=tool_timeout)
             content = _format_content(spec, result)
             # Only the built-in FAQ returns a trusted evidence-check diagnosis.
-            if name == "query_faq" and spec.source == "builtin" and isinstance(result, dict):
+            if builtin_faq and isinstance(result, dict):
                 if service_failure := result.get("service_failure"):
                     kind = service_failure["kind"]
                     status = "超时" if kind == "timeout" else "失败"
@@ -207,10 +208,12 @@ async def execute_tool_call(
             is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError))
             status = "超时" if is_timeout else "失败"
             # ⑤ 分诊:真故障如实回灌,不装没事(查询落空由工具返回语义表达,不属此路)
+            service_failure = {"stage": "faq_tool", "kind": "timeout"} if builtin_faq and is_timeout else None
             run = _run(False, f"工具暂时不可用:{'执行超时' if is_timeout else type(e).__name__},"
-                              "请稍后再试或如实告知用户。", status, attempt)
+                              "请稍后再试或如实告知用户。", status, attempt, service_failure=service_failure)
+            diagnosis = "faq_tool:timeout" if service_failure else type(e).__name__
             await _audit(conversation_id, tc_id, name, spec, args, None, status,
-                         type(e).__name__, attempt, run.duration_ms)
+                         diagnosis, attempt, run.duration_ms)
             return run
         except Exception as e:  # noqa: BLE001 业务/未知异常(含 ToolException):不重试,如实回灌
             logger.exception("工具执行失败 name=%s", name)

@@ -55,19 +55,17 @@ async def process_pending(limit: int = 50) -> dict:
             stats["skipped"] += 1
             continue
         mid = r.matched_question_id
-        if mid is not None:
-            if not any(c["id"] == mid for c in candidates):
-                logger.warning("flywheel 幻觉 id=%s lcq=%s(候选里不存在,跳过下轮重试)", mid, row.id)
-                stats["skipped"] += 1
-                continue
-            await repository.increment_occurrence(mid)
-            review_id = mid
-            stats["merged"] += 1
-        else:
-            review_id = await repository.insert_review_item(
-                r.normalized_question, r.ai_suggested_answer or None)
-            stats["created"] += 1
-        await repository.set_matched_review(row.id, review_id)
+        if mid is not None and not any(c["id"] == mid for c in candidates):
+            logger.warning("flywheel 幻觉 id=%s lcq=%s(候选里不存在,跳过下轮重试)", mid, row.id)
+            stats["skipped"] += 1
+            continue
+        review_id = await repository.match_unhandled_question(
+            row.id, r.normalized_question, r.ai_suggested_answer or None, mid,
+        )
+        if review_id is None:
+            stats["skipped"] += 1
+            continue
+        stats["created" if mid is None else "merged"] += 1
         stats["processed"] += 1
         logger.info("flywheel lcq=%s → review=%s(%s)%s", row.id, review_id,
                     "归并" if mid is not None else "新建",

@@ -30,6 +30,11 @@ async def query_logistics(
     物流单号不是订单号,需先用 query_order 查订单拿到 tracking_no,再调用本工具。"""
     if _DELAY > 0:
         await asyncio.sleep(_DELAY)
+    return logistics_snapshot(tracking_no)
+
+
+def logistics_snapshot(tracking_no: str) -> dict:
+    """Deterministic demo result without starting the MCP service."""
     rng = random.Random(f"logistics:{tracking_no}")      # 种子固定 → 同单号稳定
     code = rng.choice(_STATUS_CODES)
     city = rng.choice(_CITIES)

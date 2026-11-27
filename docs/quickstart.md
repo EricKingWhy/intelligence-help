@@ -20,7 +20,7 @@ make mcp-up
 uv run uvicorn app.main:app --port 8000
 ```
 
-`docker compose ps` 应显示 MySQL 和 Milvus 为 healthy。这条路径使用 Milvus 的内嵌 etcd 与本地存储，首次启动使用独立的向量数据卷。宿主机 3306 冲突时同时调整 `MYSQL_HOST_PORT` 和 `DATABASE_URL` 的端口。向量化成功后确认终端显示的 Milvus 条数大于零。
+`docker compose ps` 应显示 MySQL 和 Milvus 为 healthy。这条路径使用 Milvus 的内嵌 etcd 与本地存储，首次启动使用独立的向量数据卷。宿主机 3306 冲突时，可在 `.env` 设置 `MYSQL_HOST_PORT=3307`，并将 `DATABASE_URL` 的端口改为 3307。使用同一容器运行测试时，也要更新 `TEST_DATABASE_URL` 的端口。容器内部仍使用 3306。向量化成功后确认终端显示的 Milvus 条数大于零。
 
 打开 [聊天页](http://localhost:8000/)，用新会话分别发送以下消息。
 

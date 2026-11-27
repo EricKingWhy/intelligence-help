@@ -106,12 +106,10 @@ async def resume_action(req: ResumeExecution, principal: Principal):
                 raise HTTPException(409, "订单选择卡已失效，请重新发起查询")
             if not any(order["order_id"] == req.order_id for order in selection.get("orders", [])):
                 raise HTTPException(409, "请选择当前卡片中的订单")
-        if req.confirmation_id and not any(
-            isinstance(item.value, dict)
-            and (item.value.get("preview") or {}).get("confirmation_id") == req.confirmation_id
-            for item in state.interrupts
-        ):
-            raise HTTPException(409, "工单确认已失效")
+        if req.confirmation_id:
+            preview = runtime.pending_ticket_preview(state)
+            if preview is None or preview.get("confirmation_id") != req.confirmation_id:
+                raise HTTPException(409, "工单确认已失效")
     if req.order_id is not None:
         resume_value = {req.interrupt_id: req.order_id}
     else:

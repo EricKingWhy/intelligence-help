@@ -4,16 +4,20 @@
 # 简历模版：jianli.xiaolinnote.com
 import asyncio
 import json
+from itertools import count
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.types import interrupt
 
 from app.api.auth import identity
-from app.graph import runtime
+from app.graph import nodes, runtime
+from app.graph.build import build_graph
 from app.graph.state import ConversationState
 from app.main import app
 
@@ -348,3 +352,107 @@ async def test_chat_validates_empty_message():
     async with _client() as client:
         resp = await client.post("/api/chat", json={"user_id": "u1", "message": ""})
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(("confirm", "legacy_card"), [(False, False), (True, False), (True, True)])
+async def test_pending_ticket_blocks_new_turns_until_current_card_is_answered(monkeypatch, confirm, legacy_card):
+    cfg = {"configurable": {"thread_id": "7"}}
+    graph = build_graph(checkpointer=InMemorySaver())
+    writes = {}
+    model_calls = 0
+    message_ids = count(1)
+
+    async def append(cid, role, **kwargs):
+        return next(message_ids)
+
+    async def create_ticket(cid, desc, ticket_type, *, submission_key):
+        writes[submission_key] = "T-SYNTHETIC-1"
+        return writes[submission_key]
+
+    async def get_result(cid, key):
+        return writes.get(key)
+
+    async def coref(query, history):
+        return query
+
+    async def classify(query, history):
+        return {"intent": "订单", "confidence": 0.95}
+
+    async def specs():
+        return [nodes.registry.get_builtin_spec("create_ticket")]
+
+    class Model:
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages, config):
+            nonlocal model_calls
+            model_calls += 1
+            if model_calls == 1:
+                return AIMessage(content="", tool_calls=[{"name": "create_ticket", "id": "ticket", "args": {
+                    "ticket_type": "咨询", "description": "核对订单状态",
+                }}])
+            assert any(isinstance(message, ToolMessage) and message.tool_call_id == "ticket"
+                       for message in messages)
+            return AIMessage(content="会话已继续")
+
+    monkeypatch.setattr(runtime, "get_graph", lambda: graph)
+    monkeypatch.setattr(runtime.repository, "get_conversation", AsyncMock(
+        return_value=SimpleNamespace(user_id="u1", summary=None, summary_upto_msg_id=None),
+    ))
+    monkeypatch.setattr(runtime.repository, "append_message", append)
+    monkeypatch.setattr(runtime.repository, "create_ticket", create_ticket)
+    monkeypatch.setattr(runtime.repository, "get_ticket_result", get_result)
+    monkeypatch.setattr(runtime.repository, "insert_tool_audit", AsyncMock())
+    monkeypatch.setattr(runtime.summarizer, "maybe_schedule_summary", AsyncMock())
+    monkeypatch.setattr(nodes.coref, "resolve", coref)
+    monkeypatch.setattr(nodes.intent_mod, "classify", classify)
+    monkeypatch.setattr(nodes.registry, "get_all_specs", specs)
+    monkeypatch.setattr(nodes, "get_chat_model", lambda **kwargs: Model())
+    monkeypatch.setitem(app.dependency_overrides, identity, lambda: ("u1", "customer"))
+
+    def frames(response):
+        return [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+
+    if legacy_card:
+        def legacy_interrupt(payload):
+            preview = {key: value for key, value in payload["preview"].items() if key != "confirmation_id"}
+            return interrupt({**payload, "preview": preview})
+
+        monkeypatch.setattr(nodes, "interrupt", legacy_interrupt)
+
+    body = {"user_id": "u1", "conversation_id": 7, "message": "核对订单"}
+    async with _client() as tab, _client() as other_tab:
+        first = await tab.post("/api/chat", json=body)
+        pause = frames(first)[-1]
+        assert pause["event"] == "interrupt"
+        checkpoint = await graph.aget_state(cfg)
+        draft = {**body, "message": "另一条消息"}
+        rejected = await other_tab.post("/api/chat", json=draft)
+        error = frames(rejected)[0]
+        assert error["code"] == "ticket_confirmation_pending"
+        preview = error["preview"]
+        assert preview["confirmation_id"]
+        assert all(preview[key] == value for key, value in pause["preview"].items())
+        assert "data: [DONE]" not in rejected.text
+
+        rejected = await other_tab.post("/api/agent", json=draft)
+        assert rejected.status_code == 409 and rejected.json()["detail"]["preview"] == preview
+        assert (await graph.aget_state(cfg)).config == checkpoint.config
+        assert next(message_ids) == 2
+        assert model_calls == 1
+        assert not writes
+
+        decision = {"conversation_id": 7, "confirmed": confirm, "confirmation_id": preview["confirmation_id"]}
+        resolved = await tab.post("/api/actions/resume", json=decision)
+        assert resolved.is_success and frames(resolved)[-1]["event"] == "done"
+
+        stale_cancel = await other_tab.post("/api/actions/resume", json={**decision, "confirmed": False})
+        assert stale_cancel.status_code == 409
+        if confirm:
+            replay = await other_tab.post("/api/actions/resume", json=decision)
+            assert replay.is_success and "T-SYNTHETIC-1" in replay.text
+        assert len(writes) == int(confirm)
+
+        next_turn = await other_tab.post("/api/chat", json=draft)
+        assert next_turn.is_success and frames(next_turn)[-1]["final_text"] == "会话已继续"
