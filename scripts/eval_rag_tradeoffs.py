@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage
 from app.config import settings
 from app.core import coref, llm, query_understanding, retrieval, selfcheck
 from app.core.prompts import FAITHFULNESS_PROMPT, RAG_ANSWER_PROMPT
+from app.core.upstream import failure
 from scripts.eval_ch04 import (
     COVERAGE_PROMPT, STRATEGIES, _Cov, _Faith, _format_evidence, _load,
     _ranks_per_group, _recall_at, _rr,
@@ -98,12 +99,15 @@ async def evaluate_one(strategy, sample, prepared, model, coverage, faith):
     return result
 
 
+def _error_result(exc: Exception, stage: str) -> dict:
+    return {"error": type(exc).__name__, "service_failure": failure(exc, stage)}
+
+
 def summarize(rows):
     ok = [row for row in rows if "error" not in row]
     counts = {"n": len(rows), "failed": len(rows) - len(ok),
               "scoring_failed": sum("scoring_error" in row for row in ok),
-              "timeouts": sum(row.get("error") == "TimeoutError"
-                              or row.get("service_failure", {}).get("kind") == "timeout"
+              "timeouts": sum(row.get("service_failure", {}).get("kind") == "timeout"
                               for row in rows)}
     for key in ("recall_at_5", "mrr", "coverage", "faithfulness", "answer_calls", "answer_tokens",
                 "preprocessing_ms", "estimated_embedding_calls", "estimated_rerank_calls_upper_bound"):
@@ -141,8 +145,9 @@ async def run(args):
             try:
                 prepared = await asyncio.wait_for(prepare_query(sample), timeout=args.timeout)
             except Exception as exc:
+                result = _error_result(exc, "preprocessing")
                 return [{"strategy": strategy, "id": sample["id"], "bucket": sample["bucket"],
-                         "error": type(exc).__name__} for strategy in strategies]
+                         **result} for strategy in strategies]
             outcomes = []
             for strategy in strategies:
                 try:
@@ -151,7 +156,7 @@ async def run(args):
                         timeout=args.timeout,
                     )
                 except Exception as exc:
-                    result = {"error": type(exc).__name__}
+                    result = _error_result(exc, "strategy_evaluation")
                 outcomes.append({"strategy": strategy, "id": sample["id"], "bucket": sample["bucket"],
                                  **result})
             return outcomes
