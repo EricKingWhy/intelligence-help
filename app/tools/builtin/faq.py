@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.core import query_understanding, retrieval, selfcheck
+from app.core.upstream import UPSTREAM_ERRORS, failure
 from app.tools import registry
 
 
@@ -24,14 +25,16 @@ async def query_faq(keyword: str, category: str | None = None) -> dict:
     # 同义词扩展只拼进 BM25 检索文本(检索侧),不改 dense query、不改标准问法语义(ch04 spec §2)
     bm25_text = query + (" " + " ".join(u["expanded"]) if u["expanded"] else "")
 
-    hits = await retrieval.search_knowledge(
-        query, strategy="hybrid_rerank", category=category, bm25_text=bm25_text)
-
-    # 品类过滤稳健性:category 由模型自由填写,常猜错入库值(如「商品手册」≠ 实存「商品规格手册」),
-    # 精确过滤会把结果清空致误拒答。过滤后为空/全弱则回退到不过滤重试(过滤是优化、非硬约束)。
-    if category and (not hits or hits[0]["rerank_score"] < settings.rerank_min_score):
+    try:
         hits = await retrieval.search_knowledge(
-            query, strategy="hybrid_rerank", category=None, bm25_text=bm25_text)
+            query, strategy="hybrid_rerank", category=category, bm25_text=bm25_text)
+        # 模型可能猜错品类，只有过滤结果为空或过弱时才改查全库。
+        if category and (not hits or hits[0]["rerank_score"] < settings.rerank_min_score):
+            hits = await retrieval.search_knowledge(
+                query, strategy="hybrid_rerank", category=None, bm25_text=bm25_text)
+    except UPSTREAM_ERRORS as exc:
+        return {"sufficient": False, "service_failure": failure(exc, "faq_retrieval"),
+                "reason": "知识检索暂时不可用", "citations": []}
 
     # 机械闸:无召回 or 最高分低于阈值
     top = hits[0]["rerank_score"] if hits else 0.0
