@@ -36,7 +36,8 @@ _RETURN_OFFER = re.compile(
 _RETURN_DENIAL = (
     r"(?:自[^，,]{1,8}起)?(?:目前|现在|现已|已经|已|正式|全面|被|并){0,4}"
     r"(?:不再?(?:支持|提供|允许|适用|能|可|享受|执行|有效|生效|受理)|"
-    r"(?:取消|撤销|废止|废除|作废|失效|停用|停止|暂停|终止)(?:提供|执行)?)"
+    r"无法(?:支持|提供|申请|办理|享受|确认|核实)|不确定|"
+    r"(?:取消|撤销|废止|废除|作废|失效|无效|停用|停止|暂停|终止)(?:提供|执行)?)"
 )
 _REVOKED_RETURN = re.compile(
     rf"(?<!未)(?<!没有){_RETURN_DENIAL}.{{0,16}}{_NO_REASON_RETURN}"
@@ -45,6 +46,14 @@ _REVOKED_RETURN = re.compile(
 _EXCLUDED_PRODUCT = r"(?:生鲜|定制)(?:类)?(?:商品)?"
 _EXCLUDED_SUBJECT = re.compile(rf"{_EXCLUDED_PRODUCT}(?:[和与、及]{_EXCLUDED_PRODUCT})*")
 _CITATION_GROUP = re.compile(r"(\[\d+\](?:[ \t,，、]*\[\d+\])*)")
+_AFTER_RETURN_DEADLINE = re.compile(
+    rf"(?:(?:满|超过|超出)\s*{_SEVEN_DAYS}\s*(?:之后|后)?|{_SEVEN_DAYS}\s*(?:之后|后))"
+    rf"\s*[，,]?\s*(?:才|仍然?|也)?\s*(?:能|可(?:以)?|支持)(?:申请|办理|享受|发起)?\s*{_NO_REASON_RETURN}"
+)
+_WAIVES_CONDITION = re.compile(
+    r"(?:无需|无须|不必|不用|不需要)(?:仍|再)?(?:保持)?(?:商品)?完好"
+    r"|完好(?:与否|不完好)(?:都|均)(?:可以?|能|适用)"
+)
 
 
 @dataclass
@@ -154,7 +163,7 @@ def _states_return_rule(text: str, *, require_condition: bool = True) -> bool:
             denied = _REVOKED_RETURN.search(clause)
             if denied and not (ineligible_product or re.search(rf"(?:超出|超过)\s*{_SEVEN_DAYS}|逾期", clause)):
                 return False
-            if re.search(r"(?:无需|无须|不必|不用|不需要)(?:仍|再)?(?:保持)?(?:商品)?完好", clause):
+            if _WAIVES_CONDITION.search(clause):
                 return False
             excluded = denied or re.search(r"除外|不适用|不支持|不享受|除.{0,20}以外", clause)
             if (excluded and ineligible_product) or re.search(r"(?<!不)完好|不影响二次销售", clause):
@@ -172,8 +181,7 @@ def _states_return_rule(text: str, *, require_condition: bool = True) -> bool:
         stated_rule = stated_rule or (seven_day_context and offers_return)
         if not (re.search(_SEVEN_DAYS, sentence) and re.search(_NO_REASON_RETURN, sentence)):
             continue
-        if re.search(rf"(?:满|超过){_SEVEN_DAYS}(?:后)?(?:才|仍|也)(?:能|可|支持)"
-                     rf"|{_SEVEN_DAYS}后才(?:能|可|支持)", sentence):
+        if _AFTER_RETURN_DEADLINE.search(sentence):
             return False
         for clause in clauses:
             if ("价保" not in clause and not re.search(r"不是|不从|不按", clause)
@@ -188,13 +196,17 @@ def _policy_ok(reply: Reply) -> bool:
     supporting = {
         str(item.get("n")) for item in reply.citations if _states_return_rule(item.get("answer") or "")
     }
-    # The numbered references support the preceding passage, including inline references.
-    passages = _CITATION_GROUP.split(reply.answer)
-    return any(
-        supporting.intersection(re.findall(r"\[(\d+)\]", references))
-        and _states_return_rule(passage, require_condition=False)
-        for passage, references in zip(passages[::2], passages[1::2])
-    )
+    # A reference supports its preceding claim. A mid-sentence reference can precede the deadline.
+    passages = _CITATION_GROUP.split(re.sub(r"[*`]", "", reply.answer))
+    for passage, references, following in zip(passages[::2], passages[1::2], passages[2::2]):
+        if not supporting.intersection(re.findall(r"\[(\d+)\]", references)):
+            continue
+        continuation = re.match(r"[ \t]*[，,][^。；;！？!?\n]*", following)
+        if continuation and _RETURN_OFFER.search(passage):
+            passage += continuation[0]
+        if _states_return_rule(passage, require_condition=False):
+            return True
+    return False
 
 
 def _refusal_ok(reply: Reply) -> bool:
